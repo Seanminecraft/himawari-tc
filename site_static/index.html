@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>向日葵 9 號 颱風衛星圖（自動繪製）</title>
+<style>
+  body { margin: 0; font-family: system-ui, "Noto Sans TC", "Microsoft JhengHei", sans-serif; background: #0f1419; color: #e6e6e6; }
+  header { padding: 14px 18px; border-bottom: 1px solid #2a323c; }
+  h1 { font-size: 1.15rem; margin: 0 0 4px; }
+  .meta { font-size: 0.85rem; color: #9aa7b4; line-height: 1.6; }
+  .warn { color: #ffb347; }
+  main { padding: 12px 18px 30px; }
+  h2 { font-size: 1rem; margin: 18px 0 8px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  figure { margin: 0; background: #000; border: 1px solid #2a323c; border-radius: 10px; overflow: hidden; }
+  figure img { width: 100%; display: block; }
+  figcaption { padding: 6px 10px; font-size: 0.8rem; color: #9aa7b4; background: #161c23; }
+  a { color: #6cb6ff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🛰️ 向日葵 9 號 (Himawari-9) 颱風衛星圖 — 自動繪製</h1>
+  <div class="meta" id="meta">讀取 latest.json 中…</div>
+</header>
+<main id="main"></main>
+<script>
+(function () {
+  function p2(n) { return ('0' + n).slice(-2); }
+  function tw(iso) { var d = new Date(Date.parse(iso) + 8 * 3600e3); return d.getUTCFullYear() + '/' + p2(d.getUTCMonth() + 1) + '/' + p2(d.getUTCDate()) + ' ' + p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  fetch('latest.json?t=' + Date.now(), { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (p) {
+    var age = Math.round((Date.now() - Date.parse(p.scanTime)) / 60000);
+    document.getElementById('meta').innerHTML = esc(p.source) + '（<a href="' + esc(p.sourceUrl) + '">AWS 公開資料集</a>）<br>' +
+      '掃描時間：' + tw(p.scanTime) + ' 台灣時間（' + age + ' 分鐘前）' + (age > 60 ? ' <span class="warn">⚠️ 超過 60 分鐘沒有更新</span>' : '') +
+      '・產生時間：' + tw(p.generated) + '・颱風清單：' + esc((p.stormSources || []).join('、') || '—') +
+      '<br>給網站用的資料檔：<a href="latest.json">latest.json</a>';
+    var ver = '?v=' + encodeURIComponent(p.scanId);
+    document.getElementById('main').innerHTML = (p.regions || []).map(function (r) {
+      var title = r.type === 'storm' ? ('🌀 ' + r.label + ' ' + r.name + '（' + (r.category || '') + (r.vmax ? '，' + r.vmax + ' kt' : '') + '）') : '🗺️ 台灣及西北太平洋 區域總覽';
+      return '<h2>' + esc(title) + '</h2><div class="grid">' + Object.keys(r.products).map(function (k) {
+        var pr = r.products[k];
+        return '<figure><a href="' + esc(pr.src) + ver + '"><img loading="lazy" src="' + esc(pr.src) + ver + '" alt="' + esc(pr.title) + '"></a><figcaption>' + esc(pr.title) + '</figcaption></figure>';
+      }).join('') + '</div>';
+    }).join('');
+  }).catch(function (e) { document.getElementById('meta').textContent = '讀取失敗：' + e; });
+})();
+</script>
+</body>
+</html>

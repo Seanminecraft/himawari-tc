@@ -1,0 +1,142 @@
+{
+ "version": 1,
+ "satellite": "Himawari-9 AHI",
+ "source": "資料來源：JMA Himawari-9 (NOAA AWS)",
+ "sourceUrl": "https://registry.opendata.aws/noaa-himawari/",
+ "stormSources": [
+  "NRL TC Web active-storms"
+ ],
+ "scanId": "202610211020",
+ "scanTime": "2026-10-21T10:20:00Z",
+ "generated": "2026-10-21T10:41:38Z",
+ "products": {
+  "ir_bd": "紅外線 B13 (10.4µm) Dvorak BD 強化",
+  "ir_color": "紅外線 B13 (10.4µm) 彩色強化",
+  "wv": "水氣 B08 (6.2µm) 上層水氣",
+  "truecolor": "真彩 B01/B02/B03/B04 (僅日間)"
+ },
+ "regions": [
+  {
+   "id": "wp292026",
+   "type": "storm",
+   "day": false,
+   "dayFrac": 0.0,
+   "products": {
+    "ir_bd": {
+     "src": "img/wp292026/ir_bd.webp",
+     "title": "紅外線 B13 (10.4µm) Dvorak BD 強化",
+     "frames": [
+      {
+       "scanId": "202610211020",
+       "time": "2026-10-21T10:20:00Z",
+       "src": "frames/wp292026/ir_bd_202610211020.webp"
+      }
+     ]
+    },
+    "ir_color": {
+     "src": "img/wp292026/ir_color.webp",
+     "title": "紅外線 B13 (10.4µm) 彩色強化",
+     "frames": [
+      {
+       "scanId": "202610211020",
+       "time": "2026-10-21T10:20:00Z",
+       "src": "frames/wp292026/ir_color_202610211020.webp"
+      }
+     ]
+    },
+    "wv": {
+     "src": "img/wp292026/wv.webp",
+     "title": "水氣 B08 (6.2µm) 上層水氣",
+     "frames": [
+      {
+       "scanId": "202610211020",
+       "time": "2026-10-21T10:20:00Z",
+       "src": "frames/wp292026/wv_202610211020.webp"
+      }
+     ]
+    }
+   },
+   "bboxLonLat": [
+    121.23,
+    12.78,
+    134.53,
+    25.4
+   ],
+   "atcf": "wp292026",
+   "label": "29W",
+   "name": "CHAMPI",
+   "category": "超級颱風",
+   "vmax": 150.0,
+   "mslp": 904.0,
+   "fixLat": 18.7,
+   "fixLon": 128.9,
+   "fixTime": "2026-10-21T06:00:00Z",
+   "centerLat": 19.21,
+   "centerLon": 127.88,
+   "centerNote": "定位外推 4.3 h",
+   "motion": {
+    "dir": 298,
+    "kt": 15.1
+   },
+   "stormSource": "NRL"
+  },
+  {
+   "id": "overview",
+   "type": "overview",
+   "day": false,
+   "dayFrac": 0.0,
+   "products": {
+    "ir_bd": {
+     "src": "img/overview/ir_bd.webp",
+     "title": "紅外線 B13 (10.4µm) Dvorak BD 強化",
+     "frames": [
+      {
+       "scanId": "202610211020",
+       "time": "2026-10-21T10:20:00Z",
+       "src": "frames/overview/ir_bd_202610211020.webp"
+      }
+     ]
+    },
+    "ir_color": {
+     "src": "img/overview/ir_color.webp",
+     "title": "紅外線 B13 (10.4µm) 彩色強化",
+     "frames": [
+      {
+       "scanId": "202610211020",
+       "time": "2026-10-21T10:20:00Z",
+       "src": "frames/overview/ir_color_202610211020.webp"
+      }
+     ]
+    },
+    "wv": {
+     "src": "img/overview/wv.webp",
+     "title": "水氣 B08 (6.2µm) 上層水氣",
+     "frames": [
+      {
+       "scanId": "202610211020",
+       "time": "2026-10-21T10:20:00Z",
+       "src": "frames/overview/wv_202610211020.webp"
+      }
+     ]
+    }
+   },
+   "bboxLonLat": [
+    105.02,
+    5.02,
+    154.98,
+    37.99
+   ],
+   "name": "台灣及西北太平洋 區域總覽"
+  }
+ ],
+ "errors": [],
+ "stats": {
+  "t_storms": 0.9,
+  "download_mb": 15.4,
+  "download_files": 8,
+  "t_download": 0.4,
+  "t_render": 8.2,
+  "t_total": 13.0,
+  "image_kb": 1057
+ }
+}
