@@ -1,0 +1,27 @@
+# 防止「60 天沒有活動 → 排程自動停用」
+# 公開儲存庫只要 60 天沒有任何 commit，GitHub 會自動停用排程工作流程。
+# 這裡每週用 GitHub 官方 API 把兩個工作流程「重新啟用」一次（不會產生任何 commit，也不需要額外金鑰），
+# 只給這個工作 actions: write 權限，其他權限一律沒有。
+name: keepalive
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'   # 每週一 04:17 UTC（台灣 12:17）
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 重新啟用排程工作流程
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for wf in himawari.yml keepalive.yml; do
+            gh api --method PUT "/repos/$REPO/actions/workflows/$wf/enable" && echo "✅ $wf 已確認啟用"
+          done
