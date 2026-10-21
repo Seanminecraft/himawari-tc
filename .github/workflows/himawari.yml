@@ -17,7 +17,9 @@ on:
         type: string
         default: ''
 
-# 同一時間只跑一個；上一個還沒跑完，新的排隊等，不會中途取消
+# 同一時間只跑一個；上一個還沒跑完，新的排隊等，不會中途取消。
+# GitHub 規則：同一群組最多「1 個執行中＋1 個等待中」，再來新的會把舊的「等待中」取消（顯示灰色 cancelled，屬正常）。
+# 觸發來源：① Apps Script addonTick 每 10 分鐘 workflow_dispatch（主要）② 下面的 cron（備援，GitHub 排程常延遲或漏跑）
 concurrency:
   group: himawari
   cancel-in-progress: false
@@ -30,12 +32,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      skip: ${{ steps.render.outputs.skip }}
+      skip: ${{ steps.quick.outputs.skip == 'true' || steps.render.outputs.skip == 'true' }}
     steps:
       - name: 取得程式碼
         uses: actions/checkout@v7
 
+      - name: 讀取 GitHub Pages 網址
+        id: pages
+        uses: actions/configure-pages@v6
+
+      # 只用內建 python3＋標準函式庫：線上已是最新掃描就直接結束（不安裝套件、不繪圖、不部署）
+      - name: 快速檢查（線上已是最新就略過）
+        id: quick
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+          EVENT: ${{ github.event_name }}
+          IN_FORCE: ${{ inputs.force }}
+          IN_SCAN: ${{ inputs.scan }}
+        run: python3 scripts/quick_check.py
+
       - name: 安裝 Python 3.12（含 pip 快取）
+        if: steps.quick.outputs.skip != 'true'
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
@@ -43,20 +60,19 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: 海岸線資料快取（cartopy / Natural Earth）
+        if: steps.quick.outputs.skip != 'true'
         uses: actions/cache@v6
         with:
           path: ~/.local/share/cartopy
           key: cartopy-naturalearth-50m-v1
 
       - name: 安裝套件
+        if: steps.quick.outputs.skip != 'true'
         run: pip install -r requirements.txt
-
-      - name: 讀取 GitHub Pages 網址
-        id: pages
-        uses: actions/configure-pages@v6
 
       - name: 下載衛星原始檔並繪圖
         id: render
+        if: steps.quick.outputs.skip != 'true'
         env:
           PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
           MPLBACKEND: Agg
@@ -72,7 +88,7 @@ jobs:
           python scripts/himawari_pipeline.py $ARGS
 
       - name: 打包網站
-        if: steps.render.outputs.skip != 'true'
+        if: steps.quick.outputs.skip != 'true' && steps.render.outputs.skip != 'true'
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
