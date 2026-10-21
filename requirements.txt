@@ -1,0 +1,9 @@
+# 向日葵 9 號原始檔繪圖（GitHub Actions 用；Python 3.12）
+satpy==0.60.0
+pyresample==1.35.0
+pyorbital==1.14.0
+cartopy==0.26.0
+matplotlib>=3.9,<4
+pillow>=11
+numpy>=2.0
+requests>=2.31
