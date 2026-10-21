@@ -1,0 +1,94 @@
+# 向日葵 9 號原始檔 → 颱風衛星圖 → GitHub Pages
+# 每 10 分鐘自動執行（分鐘 3、13、23…，避開整點排隊尖峰），也可以在 Actions 頁面手動按 Run workflow。
+# 圖片不會存進 git：每次都打包成 Pages artifact 直接部署；動畫影格從目前線上網站抓回來接續。
+name: himawari
+
+on:
+  schedule:
+    - cron: '3-59/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '就算線上已是最新掃描也重新繪圖（測試用）'
+        type: boolean
+        default: false
+      scan:
+        description: '指定掃描時間 YYYYMMDDHHMM（UTC，留空＝最新）'
+        type: string
+        default: ''
+
+# 同一時間只跑一個；上一個還沒跑完，新的排隊等，不會中途取消
+concurrency:
+  group: himawari
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      skip: ${{ steps.render.outputs.skip }}
+    steps:
+      - name: 取得程式碼
+        uses: actions/checkout@v7
+
+      - name: 安裝 Python 3.12（含 pip 快取）
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 海岸線資料快取（cartopy / Natural Earth）
+        uses: actions/cache@v6
+        with:
+          path: ~/.local/share/cartopy
+          key: cartopy-naturalearth-50m-v1
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 讀取 GitHub Pages 網址
+        id: pages
+        uses: actions/configure-pages@v6
+
+      - name: 下載衛星原始檔並繪圖
+        id: render
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+          MPLBACKEND: Agg
+          EVENT: ${{ github.event_name }}
+          IN_FORCE: ${{ inputs.force }}
+          IN_SCAN: ${{ inputs.scan }}
+        run: |
+          ARGS="--out site"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ "$IN_FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
+            if [[ "$IN_SCAN" =~ ^[0-9]{12}$ ]]; then ARGS="$ARGS --scan $IN_SCAN --force"; fi
+          fi
+          python scripts/himawari_pipeline.py $ARGS
+
+      - name: 打包網站
+        if: steps.render.outputs.skip != 'true'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
