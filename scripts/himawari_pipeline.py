@@ -32,6 +32,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
+
+# v21.1：全圓盤可見光（B03 0.5 km 整盤）用小一點的 dask 區塊，記憶體峰值約 6.3 GB → 3.3 GB（實測），速度還更快
+os.environ.setdefault('DASK_ARRAY__CHUNK_SIZE', '32MiB')
 import requests
 
 warnings.filterwarnings('ignore')
@@ -78,6 +81,11 @@ COMPOSITE_PX = 1000
 COMPOSITE_FRAMES = 12
 MAPLAYER_BBOX = (110.0, 12.0, 135.0, 32.0)    # v17：網站首頁地圖用的真實色／水氣圖層（Web Mercator，直接 L.imageOverlay）
 MAPLAYER_PX = 2000                             # 寬 2000 px ≈ 1.3 km／px
+FULLDISK_BBOX = (64.0, -75.0, 217.0, 75.0)   # v21.1：首頁全圓盤圖層（星下點 140.7°E ±76°；經度 >180 連續表示，跨換日線；Mercator 只到 ±75°）
+FULLDISK_PX = 1600                            # 寬 1600 px ≈ 10.6 km／px（赤道），縮小看全圓盤用；台灣附近仍由 MAPLAYER 高解析度圖蓋在上面
+FULLDISK_TC_MIN = int(os.environ.get('FULLDISK_TC_MIN', '60'))   # 全圓盤 GeoColor 多久重畫一次（要下載整盤可見光約 510 MB，所以每小時一次；中間沿用線上那張）
+FULLDISK_HOLE_INSET = 0.15                    # 全圓盤圖在台灣高解析度圖範圍挖空（內縮 0.15°），避免兩層半透明疊在一起變深
+BLACKMARBLE_FD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'blackmarble_fulldisk.webp')   # v21.1：Black Marble 2016，FULLDISK_BBOX 的 Web Mercator
 BLACKMARBLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'blackmarble_maplayer.webp')   # v21：NASA Black Marble 2016（GIBS VIIRS_Black_Marble），已裁成 MAPLAYER_BBOX 的 Web Mercator
 COUNTY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'tw_county_lines.json')
 CAT_ZH = [(130, '超級颱風'), (64, '颱風'), (34, '熱帶風暴'), (0, '熱帶性低氣壓')]
@@ -334,14 +342,14 @@ def merc_region(rid, bbox, px):
                 bbox=(w - 0.6, so - 0.6, e + 0.6, n + 0.6))
 
 
-def geocolor_night(b13, b07, shape):
+def geocolor_night(b13, b07, shape, bm_path=None):
     """v21：仿 CIRA GeoColor（Miller et al. 2020, JTECH）的夜間畫面。
     底圖＝NASA Black Marble 城市燈光（靜態）；高雲＝B13 亮溫越冷越白、越不透明；
     低雲／霧＝B13−B07（10.4−3.9µm）亮溫差為正的暖雲，塗淡藍色（B07 沒抓到就略過）。回傳 (uint8 RGB, 有沒有畫低雲)"""
     from PIL import Image
     ny, nx = shape
     try:
-        bm = Image.open(BLACKMARBLE_PATH).convert('RGB')
+        bm = Image.open(bm_path or BLACKMARBLE_PATH).convert('RGB')
         if bm.size != (nx, ny):
             bm = bm.resize((nx, ny), Image.BILINEAR)
         bg = np.asarray(bm, dtype=np.float32)
@@ -362,6 +370,106 @@ def geocolor_night(b13, b07, shape):
     gray = (150 + 105 * a_hi)[..., None]
     img = img * (1 - a_hi[..., None]) + gray * a_hi[..., None]
     return np.clip(img, 0, 255).astype(np.uint8), low_ok
+
+
+def vis_sample(creg, region):
+    """v21.1：取可見光 B01–B04；某個波段沒下載（例如全圓盤不抓 B04）就回傳 None。"""
+    out = []
+    for b in VIS_BANDS:
+        try:
+            out.append(sample_band(creg, b, region))
+        except KeyError:
+            out.append(None)
+    return out
+
+
+def fulldisk_region():
+    r = merc_region('fulldisk', FULLDISK_BBOX, FULLDISK_PX)
+    r['lon_cont'] = r['lons']
+    r['lons'] = ((r['lons'] + 180.0) % 360.0) - 180.0    # 取樣用 −180–180；影像邊界仍用連續經度
+    r['res_km'] = r['res_km'] / 2.0                     # 取樣時少平均一點（高緯度 Mercator 會放大，太粗會一格一格）
+    c = np.degrees(np.arccos(np.clip(np.cos(np.radians(r['lats'])) * np.cos(np.radians(r['lon_cont'] - 140.7)), -1, 1)))
+    r['limb'] = np.clip((76.0 - c) / 3.0, 0, 1)        # 離星下點 73° 以外漸漸透明（地球邊緣太斜、格點又大又鋸齒）
+    return r
+
+
+def fulldisk_plan(prev, pages_base, scan_time, errors):
+    """v21.1：決定這一輪要不要重畫全圓盤 GeoColor；不用的話先把線上那張抓回來（回傳 (due, 舊 entry, bytes)）。"""
+    pf = (((prev or {}).get('maplayers') or {}).get('fulldisk') or {}).get('truecolor') or {}
+    if not pf.get('scanId') or not pages_base:
+        return True, None, None
+    try:
+        t0 = datetime.strptime(pf['scanId'], '%Y%m%d%H%M').replace(tzinfo=timezone.utc)
+    except Exception:
+        return True, None, None
+    age = (scan_time - t0).total_seconds() / 60.0
+    if age < 0 or age >= FULLDISK_TC_MIN - 5:
+        return True, None, None
+    try:
+        data = http_get(pages_base.rstrip('/') + '/' + pf['src'], timeout=30, binary=True)
+        return False, pf, data
+    except Exception as e:
+        errors.append('抓回線上全圓盤 GeoColor 失敗，本次重畫：%s' % str(e)[:100])
+        return True, None, None
+
+
+def build_fulldisk(scn_ir, scn_vis, scn_night, scan_id, scan_time, out, errors, tc_due, prev_tc=None, prev_bytes=None):
+    """v21.1：首頁全圓盤（半個地球）GeoColor＋水氣，低解析度，放在台灣高解析度圖層下面。
+    外太空透明；台灣高解析度範圍挖空。水氣每輪畫；GeoColor 每 FULLDISK_TC_MIN 分鐘畫一次。"""
+    from PIL import Image
+    r = fulldisk_region()
+    w, so, e, n = FULLDISK_BBOX
+    tstr = scan_time.isoformat().replace('+00:00', 'Z')
+    mw, ms_, me, mn = MAPLAYER_BBOX
+    k = FULLDISK_HOLE_INSET
+    lc = r['lon_cont']
+    hole = (lc > mw + k) & (lc < me - k) & (r['lats'] > ms_ + k) & (r['lats'] < mn - k)
+    res = {'bounds': [[so, w], [n, e]], 'scanId': scan_id, 'time': tstr, 'projection': 'Web Mercator（球面，與 Leaflet 相同）',
+           'hole': [[ms_ + k, mw + k], [mn - k, me - k]]}
+    d = os.path.join(out, 'img', 'maplayer')
+    os.makedirs(d, exist_ok=True)
+    # 水氣
+    cm, (v0, v1) = wv_cmap()
+    t = sample_band(scn_ir, 'B08', r) - 273.15
+    rgba = (cm(np.clip((t - v0) / (v1 - v0), 0, 1)) * 255).astype(np.uint8)
+    rgba[..., 3] = np.where(np.isfinite(t) & ~hole, r['limb'] * 255, 0).astype(np.uint8)
+    rel = 'img/maplayer/fd_wv_%s.webp' % scan_id
+    Image.fromarray(rgba, 'RGBA').save(os.path.join(out, rel), 'WEBP', quality=WEBP_QUALITY, method=4)
+    res['wv'] = {'src': rel, 'scanId': scan_id, 'time': tstr, 'title': '水氣 B08（6.2µm）全圓盤', 'bytes': os.path.getsize(os.path.join(out, rel))}
+    # GeoColor
+    if not tc_due and prev_tc and prev_bytes:
+        fn = os.path.join(out, prev_tc['src'])
+        os.makedirs(os.path.dirname(fn), exist_ok=True)
+        with open(fn, 'wb') as f:
+            f.write(prev_bytes)
+        res['truecolor'] = dict(prev_tc, reused=True)
+        log('完成 全圓盤圖層（水氣重畫；GeoColor 沿用 %s）' % prev_tc.get('scanId'))
+        return res
+    sza = sun_zenith(scan_time, r['lons'], r['lats'])
+    b13 = sample_band(scn_ir, 'B13', r)
+    b07 = None
+    if scn_night is not None:
+        try:
+            b07 = sample_band(scn_night, 'B07', r)
+        except Exception as ex:
+            errors.append('全圓盤 B07 取樣失敗（夜間只畫高雲）：%s' % str(ex)[:100])
+    night_rgb, low_ok = geocolor_night(b13, b07, sza.shape, BLACKMARBLE_FD_PATH)
+    rgb = night_rgb.astype(np.float32)
+    w_day = np.zeros(sza.shape, np.float32)
+    if scn_vis is not None and float(np.nanmin(sza)) < 89:
+        bands = vis_sample(scn_vis, r)
+        if bands[2] is not None:
+            day_rgb = true_color(*bands, sza, fade=False)
+            w_day = np.where(np.isfinite(bands[2]), np.clip((89.0 - sza) / 9.0, 0, 1), 0).astype(np.float32)
+            rgb = day_rgb.astype(np.float32) * w_day[..., None] + rgb * (1 - w_day[..., None])
+    alpha = np.where(np.isfinite(b13) & ~hole, r['limb'] * 255, 0).astype(np.uint8)
+    rel = 'img/maplayer/fd_truecolor_%s.webp' % scan_id
+    Image.fromarray(np.dstack([np.clip(rgb, 0, 255).astype(np.uint8), alpha]), 'RGBA').save(os.path.join(out, rel), 'WEBP', quality=WEBP_QUALITY, method=4)
+    res['truecolor'] = {'src': rel, 'scanId': scan_id, 'time': tstr, 'bytes': os.path.getsize(os.path.join(out, rel)), 'geocolor': True,
+                        'title': 'GeoColor 全圓盤（日間真實色／夜間紅外線雲＋城市燈光）',
+                        'dayPart': bool((w_day > 0).any()), 'nightPart': bool((w_day < 1).any()), 'lowCloud': low_ok, 'everyMin': FULLDISK_TC_MIN}
+    log('完成 全圓盤圖層（水氣＋GeoColor，%d×%d，%s）' % (r['nx'], r['ny'], '含低雲' if low_ok else '無低雲'))
+    return res
 
 
 def build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors, scn_night=None):
@@ -399,9 +507,10 @@ def build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors, scn_night
     day_rgb = None
     if scn_vis is not None and float(np.min(sza)) < 89:
         c_vis = scn_vis.crop(ll_bbox=r['bbox'])
-        bands = [sample_band(c_vis, b, r) for b in VIS_BANDS]
-        day_rgb = true_color(*bands, sza, fade=False)
-        w_day = np.where(np.isfinite(bands[2]), np.clip((89.0 - sza) / 9.0, 0, 1), 0).astype(np.float32)   # 天頂角 80° 以下全日間、89° 以上全夜間
+        bands = vis_sample(c_vis, r)
+        day_rgb = true_color(*bands, sza, fade=False) if bands[2] is not None else None
+        if day_rgb is not None:
+            w_day = np.where(np.isfinite(bands[2]), np.clip((89.0 - sza) / 9.0, 0, 1), 0).astype(np.float32)   # 天頂角 80° 以下全日間、89° 以上全夜間
     if day_rgb is not None:
         rgb = day_rgb.astype(np.float32) * w_day[..., None] + night_rgb.astype(np.float32) * (1 - w_day[..., None])
     else:
@@ -612,6 +721,9 @@ def wv_cmap():
 
 
 def true_color(b1, b2, b3, b4, sza, fade=True):
+    if b4 is None:                                # v21.1：全圓盤不抓 B04 → 不混綠
+        b4 = b2
+    b4 = np.where(np.isfinite(b4), b4, b2)
     r, g, b, nir = [np.nan_to_num(x, nan=0.0) / 100.0 for x in (b3, b2, b1, b4)]
     g = 0.85 * g + 0.15 * nir                     # hybrid green（AHI B02 為 0.51 µm）
     cz = np.cos(np.radians(np.minimum(sza, 85.0)))
@@ -1059,6 +1171,26 @@ def main():
         else:
             errors.append('可見光分段尚未齊全，本次略過真彩')
             any_day = False
+    # v21.1：首頁全圓盤（水氣每輪；GeoColor 每 FULLDISK_TC_MIN 分鐘，要整盤可見光）
+    fd_due, fd_prev, fd_bytes = fulldisk_plan(prev, a.pages_base, scan_time, errors)
+    all_segs = list(range(1, 11))
+    need += [seg_key(scan_id, 'B08', s) for s in all_segs]
+    if fd_due:
+        fdr = fulldisk_region()
+        fsz = sun_zenith(scan_time, fdr['lons'][::20, ::20], fdr['lats'][::20, ::20])
+        need += [seg_key(scan_id, b, s) for b in ('B13', 'B07') for s in all_segs]
+        lm = fdr['limb'][::20, ::20] > 0
+        fd_dayfrac = float(np.mean(fsz[lm] < 85)) if lm.any() else 0.0
+        stats['fulldisk_dayfrac'] = round(fd_dayfrac, 3)
+        if fd_dayfrac >= 0.02:   # 只有邊邊一小角是白天就不抓整盤可見光（約 510 MB）
+            fk = [seg_key(scan_id, b, s) for b in ('B01', 'B02', 'B03') for s in all_segs]
+            if all(k in keys for k in fk):
+                need += fk
+            else:
+                errors.append('全圓盤可見光分段尚未齊全，本次全圓盤只畫紅外線＋城市燈光')
+        stats['fulldisk_tc'] = 'render'
+    else:
+        stats['fulldisk_tc'] = 'reuse'
     # v21：首頁 GeoColor 夜間低雲用 B07（只抓首頁地圖範圍的分段；沒上傳完就略過，不影響其他圖）
     ml_reg = merc_region('maplayer', MAPLAYER_BBOX, 200)
     if float(np.max(sun_zenith(scan_time, ml_reg['lons'], ml_reg['lats']))) > 80:
@@ -1067,7 +1199,7 @@ def main():
             need += nk
         else:
             errors.append('B07 分段尚未齊全，本次夜間只畫高雲')
-    need = [k for k in need if k in keys]
+    need = list(dict.fromkeys(k for k in need if k in keys))   # v21.1：去重（全圓盤與區域分段重疊）
     tmp = tempfile.mkdtemp(prefix='hw_')
     t1 = time.time()
     files, nbytes = download(need, tmp)
@@ -1097,9 +1229,9 @@ def main():
             errors.append('B07 讀取失敗（夜間只畫高雲）：%s' % str(e)[:100])
             scn_night = None
     scn_vis = None
-    if any_day and vis_files:
+    if vis_files:   # v21.1：區域白天或全圓盤要畫 GeoColor 時都會有可見光檔
         scn_vis = Scene(reader='ahi_hsd', filenames=vis_files)
-        scn_vis.load(VIS_BANDS)
+        scn_vis.load([b for b in VIS_BANDS if any('_%s_' % b in f for f in vis_files)])
     cm_bd, vr_bd = bd_cmap()
     cm_ir, vr_ir = ir_color_cmap()
     cm_wv, vr_wv = wv_cmap()
@@ -1118,7 +1250,7 @@ def main():
             prods[pk] = {'src': rel, 'title': PRODUCTS[pk]['title']}
         if r['day'] and scn_vis is not None:
             c_vis = scn_vis.crop(ll_bbox=r['bbox'])
-            bands = [sample_band(c_vis, b, r) for b in VIS_BANDS]
+            bands = vis_sample(c_vis, r)
             sza = sun_zenith(scan_time, r['lons'], r['lats'])
             rgb = true_color(*bands, sza)
             rel = 'img/%s/truecolor.webp' % rid
@@ -1166,6 +1298,13 @@ def main():
         maplayers = build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors, scn_night)
     except Exception as e:   # 失敗不影響其他衛星圖（網站會退回紅外線）
         errors.append('首頁地圖圖層失敗：%s' % str(e)[:160])
+    if maplayers is not None:
+        try:
+            t4 = time.time()
+            maplayers['fulldisk'] = build_fulldisk(scn_ir, scn_vis, scn_night, scan_id, scan_time, out, errors, fd_due, fd_prev, fd_bytes)
+            stats['t_fulldisk'] = round(time.time() - t4, 1)
+        except Exception as e:   # 失敗只少了全圓盤，台灣附近照常
+            errors.append('首頁全圓盤圖層失敗：%s' % str(e)[:160])
     stats['t_render'] = round(time.time() - t2, 1)
     if MISSING_GLYPHS:   # v18：缺字也寫進 latest.json 的 errors，方便從網站上看到
         errors.append('字型缺字（圖上會變方框）：' + ''.join(sorted(MISSING_GLYPHS)))

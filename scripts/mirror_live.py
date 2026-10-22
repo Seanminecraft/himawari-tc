@@ -42,6 +42,9 @@ def main():
         v = (latest.get('maplayers') or {}).get(k) or {}
         if v.get('src'):
             srcs.add(v['src'])
+        v = ((latest.get('maplayers') or {}).get('fulldisk') or {}).get(k) or {}   # v21.1：全圓盤圖層
+        if v.get('src'):
+            srcs.add(v['src'])
     srcs = sorted(s for s in srcs if s and '..' not in s and not s.startswith('/'))
     if os.path.isdir(out):
         shutil.rmtree(out)
