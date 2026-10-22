@@ -46,8 +46,9 @@ UA = {'User-Agent': 'doujin-weather-himawari/1.0 (+GitHub Actions; public Himawa
 
 SUB_LON = 140.7
 GEOS = dict(proj='geos', h=35785863.0, lon_0=SUB_LON, a=6378137.0, rf=298.257024882273, units='m')
-BAND_RES = {'B01': 'R10', 'B02': 'R10', 'B03': 'R05', 'B04': 'R10', 'B08': 'R20', 'B13': 'R20'}
+BAND_RES = {'B01': 'R10', 'B02': 'R10', 'B03': 'R05', 'B04': 'R10', 'B07': 'R20', 'B08': 'R20', 'B13': 'R20'}
 IR_BANDS = ['B13', 'B08']
+NIGHT_BANDS = ['B07']             # v21：GeoColor 夜間低雲／霧（B13−B07）；只抓首頁地圖範圍的分段（約 7 MB），抓不到就只畫高雲
 VIS_BANDS = ['B01', 'B02', 'B03', 'B04']
 
 MAX_STORMS = 3            # 同時最多幾個颱風（依強度排序）
@@ -77,6 +78,7 @@ COMPOSITE_PX = 1000
 COMPOSITE_FRAMES = 12
 MAPLAYER_BBOX = (110.0, 12.0, 135.0, 32.0)    # v17：網站首頁地圖用的真實色／水氣圖層（Web Mercator，直接 L.imageOverlay）
 MAPLAYER_PX = 2000                             # 寬 2000 px ≈ 1.3 km／px
+BLACKMARBLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'blackmarble_maplayer.webp')   # v21：NASA Black Marble 2016（GIBS VIIRS_Black_Marble），已裁成 MAPLAYER_BBOX 的 Web Mercator
 COUNTY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'tw_county_lines.json')
 CAT_ZH = [(130, '超級颱風'), (64, '颱風'), (34, '熱帶風暴'), (0, '熱帶性低氣壓')]
 
@@ -332,8 +334,39 @@ def merc_region(rid, bbox, px):
                 bbox=(w - 0.6, so - 0.6, e + 0.6, n + 0.6))
 
 
-def build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors):
+def geocolor_night(b13, b07, shape):
+    """v21：仿 CIRA GeoColor（Miller et al. 2020, JTECH）的夜間畫面。
+    底圖＝NASA Black Marble 城市燈光（靜態）；高雲＝B13 亮溫越冷越白、越不透明；
+    低雲／霧＝B13−B07（10.4−3.9µm）亮溫差為正的暖雲，塗淡藍色（B07 沒抓到就略過）。回傳 (uint8 RGB, 有沒有畫低雲)"""
+    from PIL import Image
+    ny, nx = shape
+    try:
+        bm = Image.open(BLACKMARBLE_PATH).convert('RGB')
+        if bm.size != (nx, ny):
+            bm = bm.resize((nx, ny), Image.BILINEAR)
+        bg = np.asarray(bm, dtype=np.float32)
+    except Exception as e:
+        log('（城市燈光底圖讀取失敗，改用深藍底：%s）' % e)
+        bg = np.zeros((ny, nx, 3), np.float32) + np.array([8, 10, 22], np.float32)
+    bg = np.maximum(bg, np.array([6, 8, 20], np.float32))           # 海面／陸地保持深藍黑，不會全黑
+    t = np.nan_to_num(b13, nan=300.0)
+    img = bg
+    low_ok = False
+    if b07 is not None and np.isfinite(b07).any():
+        d = t - np.nan_to_num(b07, nan=400.0)                          # 水雲在 3.9µm 放射率較低 → 差值為正
+        a_low = np.clip((d - 1.0) / 4.0, 0, 1) * np.clip((t - 255.0) / 10.0, 0, 1) * 0.85
+        low = np.array([150, 190, 228], np.float32)                   # GeoColor 低雲的淡藍色
+        img = img * (1 - a_low[..., None]) + low * a_low[..., None]
+        low_ok = True
+    a_hi = np.clip((288.0 - t) / 68.0, 0, 1) ** 0.9                   # 288 K 以上透明、220 K 以下全白
+    gray = (150 + 105 * a_hi)[..., None]
+    img = img * (1 - a_hi[..., None]) + gray * a_hi[..., None]
+    return np.clip(img, 0, 255).astype(np.uint8), low_ok
+
+
+def build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors, scn_night=None):
     """v17：網站首頁地圖的「真實色」「水氣」圖層（取代連不上的 RAMMB/CIRA SLIDER）。
+    v21：真實色改成 GeoColor：白天＝真實色，夜間＝紅外線雲＋城市燈光，晨昏線用太陽天頂角 80–89° 平滑混合，日夜都有圖。
     輸出 img/maplayer/{truecolor,wv}.webp；回傳 latest.json 的 maplayers 欄位。"""
     from PIL import Image
     r = merc_region('maplayer', MAPLAYER_BBOX, MAPLAYER_PX)
@@ -352,17 +385,38 @@ def build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors):
     sza = sun_zenith(scan_time, r['lons'], r['lats'])
     day_frac = float(np.mean(sza < 85))
     res['dayFrac'] = round(day_frac, 2)
-    if scn_vis is not None and day_frac >= 0.15:
+    res['night'] = day_frac < 0.15          # 仍回報（網站用來顯示「夜間是紅外線＋城市燈光合成」說明）
+    # ---- v21 GeoColor ----
+    b13 = sample_band(c_ir, 'B13', r)
+    b07 = None
+    if scn_night is not None and float(np.max(sza)) > 80:
+        try:
+            b07 = sample_band(scn_night.crop(ll_bbox=r['bbox']), 'B07', r)
+        except Exception as ex:
+            errors.append('B07 低雲取樣失敗（夜間只畫高雲）：%s' % str(ex)[:100])
+    night_rgb, low_ok = geocolor_night(b13, b07, sza.shape)
+    w_day = np.zeros(sza.shape, np.float32)
+    day_rgb = None
+    if scn_vis is not None and float(np.min(sza)) < 89:
         c_vis = scn_vis.crop(ll_bbox=r['bbox'])
         bands = [sample_band(c_vis, b, r) for b in VIS_BANDS]
-        rgb = true_color(*bands, sza)
-        alpha = np.where(np.isfinite(bands[2]), np.clip((92.0 - sza) / 6.0, 0, 1) * 255, 0).astype(np.uint8)   # 夜間側透明
-        rel = 'img/maplayer/truecolor_%s.webp' % scan_id
-        Image.fromarray(np.dstack([rgb, alpha]), 'RGBA').save(os.path.join(out, rel), 'WEBP', quality=WEBP_QUALITY, method=4)
-        res['truecolor'] = {'src': rel, 'title': '真實色 B01/B02/B03（僅日間）', 'bytes': os.path.getsize(os.path.join(out, rel))}
+        day_rgb = true_color(*bands, sza, fade=False)
+        w_day = np.where(np.isfinite(bands[2]), np.clip((89.0 - sza) / 9.0, 0, 1), 0).astype(np.float32)   # 天頂角 80° 以下全日間、89° 以上全夜間
+    if day_rgb is not None:
+        rgb = day_rgb.astype(np.float32) * w_day[..., None] + night_rgb.astype(np.float32) * (1 - w_day[..., None])
     else:
-        res['night'] = True
-    log('完成 首頁地圖圖層（%s，%d×%d）' % ('、'.join(k for k in ('truecolor', 'wv') if k in res), r['nx'], r['ny']))
+        rgb = night_rgb.astype(np.float32)
+    alpha = np.where(np.isfinite(b13) | (w_day > 0), 255, 0).astype(np.uint8)   # 有資料的地方全不透明
+    rel = 'img/maplayer/truecolor_%s.webp' % scan_id
+    Image.fromarray(np.dstack([np.clip(rgb, 0, 255).astype(np.uint8), alpha]), 'RGBA').save(os.path.join(out, rel), 'WEBP', quality=WEBP_QUALITY, method=4)
+    day_part = day_rgb is not None and bool((w_day > 0).any())
+    res['truecolor'] = {'src': rel, 'bytes': os.path.getsize(os.path.join(out, rel)), 'geocolor': True,
+                        'title': 'GeoColor（日間真實色／夜間紅外線雲＋城市燈光）',
+                        'dayPart': day_part, 'nightPart': bool((w_day < 1).any()), 'lowCloud': low_ok,
+                        'nightNote': '夜間＝紅外線 B13 雲' + ('＋B13−B07 低雲／霧（淡藍）' if low_ok else '') + '＋NASA Black Marble 2016 城市燈光（靜態底圖），不是真的可見光'}
+    if scn_vis is None and float(np.min(sza)) < 80:
+        errors.append('本次沒有可見光 → 首頁 GeoColor 白天部分也用紅外線＋城市燈光畫')
+    log('完成 首頁地圖圖層（%s，%d×%d，GeoColor 日間比例 %.2f%s）' % ('、'.join(k for k in ('truecolor', 'wv') if k in res), r['nx'], r['ny'], day_frac, '，含低雲' if low_ok else ''))
     return res
 
 
@@ -557,15 +611,16 @@ def wv_cmap():
     return _lsc('wv', stops, -90, 10), (-90, 10)
 
 
-def true_color(b1, b2, b3, b4, sza):
+def true_color(b1, b2, b3, b4, sza, fade=True):
     r, g, b, nir = [np.nan_to_num(x, nan=0.0) / 100.0 for x in (b3, b2, b1, b4)]
     g = 0.85 * g + 0.15 * nir                     # hybrid green（AHI B02 為 0.51 µm）
     cz = np.cos(np.radians(np.minimum(sza, 85.0)))
     rgb = np.stack([r, g, b], -1) / np.maximum(cz, 0.087)[..., None]
     x = np.clip(rgb, 0, 1.2) * 255
     y = np.interp(x, [0, 25, 55, 100, 255, 306], [0, 90, 140, 175, 255, 255])   # CIRA 式非線性拉伸
-    fade = np.clip((90.0 - sza) / 8.0, 0, 1)[..., None]                          # 晨昏線漸暗
-    out = (y * fade).astype(np.uint8)
+    if fade:
+        y = y * np.clip((90.0 - sza) / 8.0, 0, 1)[..., None]                     # 晨昏線漸暗（v21 首頁 GeoColor 改用日夜混合，不漸暗）
+    out = y.astype(np.uint8)
     nod = ~np.isfinite(b3)
     out[nod] = 0
     return out
@@ -1004,6 +1059,14 @@ def main():
         else:
             errors.append('可見光分段尚未齊全，本次略過真彩')
             any_day = False
+    # v21：首頁 GeoColor 夜間低雲用 B07（只抓首頁地圖範圍的分段；沒上傳完就略過，不影響其他圖）
+    ml_reg = merc_region('maplayer', MAPLAYER_BBOX, 200)
+    if float(np.max(sun_zenith(scan_time, ml_reg['lons'], ml_reg['lats']))) > 80:
+        nk = [seg_key(scan_id, b, s) for b in NIGHT_BANDS for s in segments_for([ml_reg])]
+        if all(k in keys for k in nk):
+            need += nk
+        else:
+            errors.append('B07 分段尚未齊全，本次夜間只畫高雲')
     need = [k for k in need if k in keys]
     tmp = tempfile.mkdtemp(prefix='hw_')
     t1 = time.time()
@@ -1024,6 +1087,15 @@ def main():
     vis_files = [f for f in files if any('_%s_' % b in f for b in VIS_BANDS)]
     scn_ir = Scene(reader='ahi_hsd', filenames=ir_files)
     scn_ir.load(IR_BANDS)
+    scn_night = None
+    night_files = [f for f in files if any('_%s_' % b in f for b in NIGHT_BANDS)]
+    if night_files:
+        try:
+            scn_night = Scene(reader='ahi_hsd', filenames=night_files)
+            scn_night.load(NIGHT_BANDS)
+        except Exception as e:
+            errors.append('B07 讀取失敗（夜間只畫高雲）：%s' % str(e)[:100])
+            scn_night = None
     scn_vis = None
     if any_day and vis_files:
         scn_vis = Scene(reader='ahi_hsd', filenames=vis_files)
@@ -1091,7 +1163,7 @@ def main():
         errors.append('衛星＋雷達疊圖失敗：%s' % str(e)[:160])
     maplayers = None
     try:
-        maplayers = build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors)
+        maplayers = build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors, scn_night)
     except Exception as e:   # 失敗不影響其他衛星圖（網站會退回紅外線）
         errors.append('首頁地圖圖層失敗：%s' % str(e)[:160])
     stats['t_render'] = round(time.time() - t2, 1)
