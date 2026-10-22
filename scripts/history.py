@@ -9,6 +9,7 @@
   4. 刪掉超過 48 小時的圖，總量超過預算（HIST_BUDGET_MB）就從最舊、最大的產品開始刪。
   5. 寫出 history/history.json（網頁回放用的索引：每種產品的時間與圖片網址）。
 v19：ATMS 微波暖心分析圖（atms/img/，每次過境一張）也收進回放（history/atms/，寬 1000 px），每張附摘要（衛星、最大暖異常、估計氣壓）。
+v20：ATMS 被動微波影像 89／165 GHz（atms/mw/，每次過境各一張）收進 mw89／mw165（history/mw89/、history/mw165/，寬 760 px，每張約 60 KB）。
 任何一步失敗都不會擋住部署：最壞情況是沿用快取裡上一版的回放圖。
 需要 numpy＋pillow（兩種安裝路徑都有）。不會讀取或印出任何金鑰。
 """
@@ -37,6 +38,8 @@ WEBP_Q = 70
 REGION_PRODUCTS = ('ir_bd', 'ir_color', 'wv')
 ATMS_PX = 1000
 ATMS_KEYS = ('atcf', 'label', 'name', 'sat', 'satName', 'maxAnom', 'maxHPa', 'dTb8', 'pEst', 'quality')
+MW_PX = 760
+MW_GROUPS = ('mw89', 'mw165')    # v20 被動微波影像
 UA = {'User-Agent': 'doujin-weather-himawari/1.0 (+GitHub Actions; history)'}
 SAFE = re.compile(r'^history/[a-z0-9_]+/[a-z0-9_]+_\d{12}\.(png|webp)$')
 
@@ -68,14 +71,14 @@ def sid(t):
 
 def empty_index():
     return {'version': 1, 'hours': HOURS, 'cadenceMin': CADENCE_MIN, 'radar': {'bounds': None, 'frames': []},
-            'sat': {'bounds': None, 'truecolor': [], 'wv': []}, 'comp': {'frames': []}, 'atms': {'frames': []}, 'regions': {}, 'radarMissing': []}
+            'sat': {'bounds': None, 'truecolor': [], 'wv': []}, 'comp': {'frames': []}, 'atms': {'frames': []}, 'mw89': {'frames': []}, 'mw165': {'frames': []}, 'regions': {}, 'radarMissing': []}
 
 
 # ----------------------------------------------------------------------------- 索引走訪
 def groups(idx):
     """回傳 [(名稱, 影格 list)]（list 是索引裡的同一個物件，可就地修改）"""
     out = [('radar', idx['radar']['frames']), ('sat.truecolor', idx['sat']['truecolor']), ('sat.wv', idx['sat']['wv']),
-           ('comp', idx['comp']['frames']), ('atms', idx['atms']['frames'])]
+           ('comp', idx['comp']['frames']), ('atms', idx['atms']['frames'])] + [(g, idx[g]['frames']) for g in MW_GROUPS]
     for rid, r in idx['regions'].items():
         for pk in REGION_PRODUCTS:
             out.append(('%s.%s' % (rid, pk), r.setdefault(pk, [])))
@@ -108,7 +111,7 @@ def normalize(idx):
     base = empty_index()
     if not isinstance(idx, dict):
         return base
-    for k in ('radar', 'sat', 'comp', 'atms'):
+    for k in ('radar', 'sat', 'comp', 'atms') + MW_GROUPS:
         if isinstance(idx.get(k), dict):
             base[k].update(idx[k])
     base['regions'] = {k: v for k, v in (idx.get('regions') or {}).items() if isinstance(v, dict)}
@@ -317,6 +320,30 @@ def run(out, cache, pages_base, now=None, backfill_max=BACKFILL_MAX):
         ent.update({k: ps.get(k) for k in ATMS_KEYS if ps.get(k) is not None})
         add('atms', al, ent, lambda dst, p=p: shrink(p, dst, ATMS_PX))
         have.add(rel)
+
+    # 3g) v20：ATMS 被動微波影像 89／165 GHz（每次過境各一張）
+    for mp in aman.get('mw') or []:
+        try:
+            t = ptime(mp['t'])
+        except Exception:
+            continue
+        if t < cutoff:
+            continue
+        for prod, pv in (mp.get('products') or {}).items():
+            g = 'mw' + prod
+            if g not in MW_GROUPS:
+                continue
+            m = re.match(r'^atms/mw/([a-z0-9_]+_\d{12})_(89|165)\.png$', (pv or {}).get('src') or '')
+            p = os.path.join(out, (pv or {}).get('src') or '-')
+            if not m or not os.path.isfile(p):
+                continue
+            rel = 'history/%s/%s.webp' % (g, m.group(1))   # 檔名要符合 SAFE（…_YYYYMMDDHHMM.webp）
+            lst = idx[g]['frames']
+            if any(f['src'] == rel for f in lst):
+                continue
+            ent = {'t': iso(t), 'src': rel, 'atcf': mp.get('atcf'), 'label': mp.get('label'), 'name': mp.get('name'),
+                   'sat': mp.get('sat'), 'satName': mp.get('satName'), 'fp': pv.get('footprintKm'), 'tbMin': pv.get('tbMin150km')}
+            add(g, lst, ent, lambda dst, p=p: shrink(p, dst, MW_PX))
 
     for rid in [r for r, m in idx['regions'].items() if not any(m.get(pk) for pk in REGION_PRODUCTS)]:
         del idx['regions'][rid]          # 颱風消散超過 48 小時 → 整個視窗移除
