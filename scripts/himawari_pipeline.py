@@ -71,6 +71,13 @@ PRODUCTS = {
     'wv':        {'title': '水氣 B08 (6.2µm) 上層水氣', 'short': '水氣'},
     'truecolor': {'title': '真彩 B01/B02/B03/B04 (僅日間)', 'short': '真彩 (日間)'},
 }
+# v17：台灣 衛星＋雷達回波疊圖（cwa_radar.py 提供雷達格點；不用金鑰，S3 公開鏡像）
+COMPOSITE_BBOX = (116.6, 20.4, 124.4, 27.6)   # 經度 116.6–124.4E、緯度 20.4–27.6N（含澎湖、金門、馬祖）
+COMPOSITE_PX = 1000
+COMPOSITE_FRAMES = 12
+MAPLAYER_BBOX = (110.0, 12.0, 135.0, 32.0)    # v17：網站首頁地圖用的真實色／水氣圖層（Web Mercator，直接 L.imageOverlay）
+MAPLAYER_PX = 2000                             # 寬 2000 px ≈ 1.3 km／px
+COUNTY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'tw_county_lines.json')
 CAT_ZH = [(130, '超級颱風'), (64, '颱風'), (34, '熱帶風暴'), (0, '熱帶性低氣壓')]
 
 
@@ -288,6 +295,106 @@ def build_regions(storms):
         lo = np.where(r['lons'] < 0, r['lons'] + 360, r['lons'])
         r['bbox'] = (float(lo.min()) - 0.6, float(r['lats'].min()) - 0.6, float(lo.max()) + 0.6, float(r['lats'].max()) + 0.6)
     return regions
+
+
+def bbox_region(rid, bbox, px):
+    """任意經緯度範圍 → 與 build_regions 相同結構的 Mercator 繪圖範圍（給疊圖用）"""
+    import cartopy.crs as ccrs
+    w, so, e, n = bbox
+    crs = ccrs.Mercator(central_longitude=(w + e) / 2)
+    x0, y0 = crs.transform_point(w, so, ccrs.PlateCarree())
+    x1, y1 = crs.transform_point(e, n, ccrs.PlateCarree())
+    nx = px
+    ny = int(round(nx * (y1 - y0) / (x1 - x0)))
+    r = dict(id=rid, type='composite', storm=None, crs=crs, extent=(x0, x1, y0, y1), nx=nx, ny=ny, marks=[])
+    dx, dy = (x1 - x0) / nx, (y1 - y0) / ny
+    X, Y = np.meshgrid(x0 + dx * (np.arange(nx) + 0.5), y1 - dy * (np.arange(ny) + 0.5))
+    pts = ccrs.PlateCarree().transform_points(crs, X, Y)
+    r['lons'], r['lats'] = pts[..., 0], pts[..., 1]
+    r['res_km'] = dx / 1000.0 * math.cos(math.radians(float(np.nanmean(r['lats']))))
+    r['bbox'] = (w - 0.6, so - 0.6, e + 0.6, n + 0.6)
+    return r
+
+
+def merc_region(rid, bbox, px):
+    """經緯度範圍 → 球面 Web Mercator 均勻格網（與 Leaflet 相同），影像可直接用四角 L.imageOverlay。"""
+    w, so, e, n = bbox
+    my = lambda la: math.log(math.tan(math.pi / 4 + math.radians(la) / 2))
+    y0, y1 = my(so), my(n)
+    nx = px
+    ny = int(round(nx * (y1 - y0) / math.radians(e - w)))
+    lon = w + (e - w) * (np.arange(nx) + 0.5) / nx
+    y = y1 - (y1 - y0) * (np.arange(ny) + 0.5) / ny
+    lat = np.degrees(2 * np.arctan(np.exp(y)) - math.pi / 2)
+    lons, lats = np.meshgrid(lon, lat)
+    res = (e - w) / nx * 111.32 * math.cos(math.radians((so + n) / 2))
+    return dict(id=rid, type='maplayer', storm=None, nx=nx, ny=ny, marks=[], lons=lons, lats=lats, res_km=res,
+                bbox=(w - 0.6, so - 0.6, e + 0.6, n + 0.6))
+
+
+def build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors):
+    """v17：網站首頁地圖的「真實色」「水氣」圖層（取代連不上的 RAMMB/CIRA SLIDER）。
+    輸出 img/maplayer/{truecolor,wv}.webp；回傳 latest.json 的 maplayers 欄位。"""
+    from PIL import Image
+    r = merc_region('maplayer', MAPLAYER_BBOX, MAPLAYER_PX)
+    w, so, e, n = MAPLAYER_BBOX
+    tstr = scan_time.isoformat().replace('+00:00', 'Z')
+    res = {'bounds': [[so, w], [n, e]], 'scanId': scan_id, 'time': tstr, 'projection': 'Web Mercator（球面，與 Leaflet 相同）'}
+    os.makedirs(os.path.join(out, 'img', 'maplayer'), exist_ok=True)
+    c_ir = scn_ir.crop(ll_bbox=r['bbox'])
+    cm, (v0, v1) = wv_cmap()
+    t = sample_band(c_ir, 'B08', r) - 273.15
+    rgba = (cm(np.clip((t - v0) / (v1 - v0), 0, 1)) * 255).astype(np.uint8)
+    rgba[..., 3] = np.where(np.isfinite(t), 255, 0)
+    rel = 'img/maplayer/wv_%s.webp' % scan_id
+    Image.fromarray(rgba, 'RGBA').save(os.path.join(out, rel), 'WEBP', quality=WEBP_QUALITY, method=4)
+    res['wv'] = {'src': rel, 'title': '水氣 B08（6.2µm）上層水氣', 'bytes': os.path.getsize(os.path.join(out, rel))}
+    sza = sun_zenith(scan_time, r['lons'], r['lats'])
+    day_frac = float(np.mean(sza < 85))
+    res['dayFrac'] = round(day_frac, 2)
+    if scn_vis is not None and day_frac >= 0.15:
+        c_vis = scn_vis.crop(ll_bbox=r['bbox'])
+        bands = [sample_band(c_vis, b, r) for b in VIS_BANDS]
+        rgb = true_color(*bands, sza)
+        alpha = np.where(np.isfinite(bands[2]), np.clip((92.0 - sza) / 6.0, 0, 1) * 255, 0).astype(np.uint8)   # 夜間側透明
+        rel = 'img/maplayer/truecolor_%s.webp' % scan_id
+        Image.fromarray(np.dstack([rgb, alpha]), 'RGBA').save(os.path.join(out, rel), 'WEBP', quality=WEBP_QUALITY, method=4)
+        res['truecolor'] = {'src': rel, 'title': '真實色 B01/B02/B03（僅日間）', 'bytes': os.path.getsize(os.path.join(out, rel))}
+    else:
+        res['night'] = True
+    log('完成 首頁地圖圖層（%s，%d×%d）' % ('、'.join(k for k in ('truecolor', 'wv') if k in res), r['nx'], r['ny']))
+    return res
+
+
+def decode_polyline(sx):
+    i, lat, lng, out = 0, 0, 0, []
+    while i < len(sx):
+        vals = []
+        for _ in range(2):
+            r = sh = 0
+            while True:
+                b = ord(sx[i]) - 63
+                i += 1
+                r |= (b & 31) << sh
+                sh += 5
+                if b < 32:
+                    break
+            vals.append(~(r >> 1) if r & 1 else r >> 1)
+        lat += vals[0]
+        lng += vals[1]
+        out.append((lat / 1e4, lng / 1e4))
+    return out
+
+
+def county_lines():
+    """縣市界線（內政部國土測繪中心 直轄市、縣市界線，經 taiwan-atlas 簡化；與網站同一份）"""
+    try:
+        with open(COUNTY_PATH, encoding='utf-8') as f:
+            d = json.load(f)
+        return [decode_polyline(x) for x in d.get('inner', []) + d.get('coast', [])]
+    except Exception as e:
+        log('（略過縣市界線：%s）' % e)
+        return []
 
 
 def segments_for(regions):
@@ -647,6 +754,135 @@ def restore_frames(prev, pages_base, out_dir, region_ids, scan_time):
     return kept
 
 
+# ----------------------------------------------------------------------------- v17 衛星＋雷達疊圖
+def radar_on_region(g, region):
+    """雷達格點（TWD67 經緯度、南→北）→ 繪圖範圍每個像素的 RGBA（最近鄰；範圍外透明）"""
+    import cwa_radar as cr
+    rgba = cr.colorize(g['v'], 'radar')
+    lon = region['lons'] - cr.DATUM_DLON
+    lat = region['lats'] - cr.DATUM_DLAT
+    ix = np.round((lon - g['lon0']) / g['res']).astype(int)
+    iy = np.round((lat - g['lat0']) / g['res']).astype(int)
+    ok = (ix >= 0) & (ix < g['nx']) & (iy >= 0) & (iy < g['ny'])
+    out = np.zeros(region['lons'].shape + (4,), dtype=np.uint8)
+    out[ok] = rgba[iy[ok], ix[ok]]
+    return out
+
+
+def render_composite(region, base_rgb, radar_rgba, scan_time, radar_time, is_day, out_path):
+    import matplotlib.pyplot as plt
+    import matplotlib.patheffects as pe
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.colorbar import ColorbarBase
+    from PIL import Image
+    import cwa_radar as cr
+
+    a = radar_rgba[..., 3:4].astype(np.float32) / 255.0
+    rgb = (base_rgb.astype(np.float32) * (1 - a) + radar_rgba[..., :3].astype(np.float32) * a).astype(np.uint8)
+    nx, ny = region['nx'], region['ny']
+    top, bot = 74, 96
+    W, H = nx, ny + top + bot
+    fig = plt.figure(figsize=(W / 100, H / 100), dpi=100, facecolor='#101418')
+    ax = fig.add_axes([0, bot / H, 1, ny / H], projection=region['crs'])
+    ax.set_extent(region['extent'], crs=region['crs'])
+    ax.imshow(rgb, origin='upper', extent=region['extent'], transform=region['crs'], interpolation='nearest')
+    halo = [pe.withStroke(linewidth=2.0, foreground='#000000')]
+    for ln in county_lines():
+        la = [p[0] for p in ln]
+        lo = [p[1] for p in ln]
+        ax.plot(lo, la, color='#0b1020', lw=1.9, alpha=0.55, transform=ccrs.PlateCarree())
+        ax.plot(lo, la, color='#f8fafc', lw=0.75, alpha=0.95, transform=ccrs.PlateCarree())
+    ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='#ffe94d', linewidth=0.5)   # 大陸／菲律賓海岸
+    gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True, linewidth=0.4, color='#ffffff', alpha=0.4,
+                      linestyle='--', xlocs=np.arange(110, 130, 1), ylocs=np.arange(15, 35, 1), x_inline=False, y_inline=False)
+    gl.top_labels = gl.right_labels = False
+    gl.xlabel_style = gl.ylabel_style = {'size': 8, 'color': '#ffffff', 'path_effects': halo}
+    gl.xpadding = gl.ypadding = -12
+    add_logo(fig, W, H, bot, ny)
+    tw = scan_time + timedelta(hours=8)
+    base_t = '衛星：Himawari-9 真實色（B01/B02/B03）' if is_day else '衛星：Himawari-9 紅外線 B13（夜間，無真實色）'
+    fig.text(0.012, 1 - 28 / H, '台灣 衛星＋雷達回波疊圖', color='#ffffff', fontsize=15, fontweight='bold', va='center')
+    fig.text(0.012, 1 - 56 / H, base_t, color='#9fd3ff' if is_day else '#ffb347', fontsize=12, va='center')
+    fig.text(0.988, 1 - 28 / H, '衛星 ' + tw.strftime('%m/%d %H:%M') + '（台灣）', color='#ffd27f', fontsize=12, ha='right', va='center')
+    fig.text(0.988, 1 - 56 / H, '雷達 ' + radar_time.astimezone(cr.TPE).strftime('%m/%d %H:%M') + '（台灣）', color='#ffd27f',
+             fontsize=12, ha='right', va='center')
+    # dBZ 色條（與網頁同一份色階；線性內插，畫成 0.5 dBZ 細格）
+    stops = cr.load_scale('radar_dbz.json')
+    xs = np.array([x for x, _ in stops if x <= 70], dtype=float)
+    vals = np.arange(0, 70.01, 0.5)
+    cs = np.stack([np.interp(vals, [x for x, _ in stops], [c[k] for _, c in stops]) for k in range(4)], -1) / 255.0
+    cs[:, 3] = np.maximum(cs[:, 3], 0.25)
+    cax = fig.add_axes([0.05, 56 / H, 0.9, 14 / H])
+    cax.set_facecolor('#3a4048')
+    ColorbarBase(cax, cmap=ListedColormap(cs[:-1]), norm=BoundaryNorm(vals, len(vals) - 1), orientation='horizontal',
+                 ticks=list(range(0, 71, 5)))
+    cax.tick_params(colors='#ffffff', labelsize=8, length=2, pad=1)
+    cax.text(1.0, -2.1, '雷達回波 (dBZ)', transform=cax.transAxes, ha='right', va='center', color='#cccccc', fontsize=8)
+    fig.text(0.012, 14 / H, SOURCE_LABEL + '　雷達：中央氣象署 O-A0059-001　縣市界：內政部國土測繪中心　自行繪製（GitHub Actions）',
+             color='#e0e0e0', fontsize=8.5, va='center')
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    im = Image.open(buf).convert('RGB')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    im.save(out_path, 'WEBP', quality=WEBP_QUALITY, method=4)
+    return os.path.getsize(out_path)
+
+
+def build_composite(scn_ir, scn_vis, scan_id, scan_time, prev, pages_base, out, errors):
+    """回傳 latest.json 的 composite 欄位（失敗回傳 None，不影響其他產品）"""
+    import cwa_radar as cr
+    r = bbox_region('taiwan', COMPOSITE_BBOX, COMPOSITE_PX)
+    g = cr.fetch_radar_at(scan_time)          # 與衛星同時間的雷達歷史檔（±10–20 分鐘）
+    if g is None:
+        try:
+            g = cr.parse_grid(cr.fetch_json('radar')[0])
+        except Exception as e:
+            errors.append('疊圖：抓不到雷達（%s）' % cr._mask_key(e)[:100])
+            return None
+    sza = sun_zenith(scan_time, r['lons'], r['lats'])
+    is_day = bool(scn_vis is not None and float(np.mean(sza < 80)) >= 0.5)
+    if is_day:
+        c_vis = scn_vis.crop(ll_bbox=r['bbox'])
+        base = true_color(*[sample_band(c_vis, b, r) for b in VIS_BANDS], sza)
+    else:
+        c_ir = scn_ir.crop(ll_bbox=r['bbox'])
+        t = sample_band(c_ir, 'B13', r) - 273.15
+        gray = np.clip((30.0 - np.nan_to_num(t, nan=30.0)) / 110.0, 0, 1) * 235 + 10   # 冷＝白、暖＝暗
+        base = np.repeat(gray[..., None], 3, -1).astype(np.uint8)
+    rel = 'img/taiwan/radar_sat.webp'
+    size = render_composite(r, base, radar_on_region(g, r), scan_time, g['time'], is_day, os.path.join(out, rel))
+    # 動畫影格：抓回線上舊影格＋本次
+    os.makedirs(os.path.join(out, 'frames', 'taiwan'), exist_ok=True)
+    fr_rel = 'frames/taiwan/radar_sat_%s.webp' % scan_id
+    shutil.copyfile(os.path.join(out, rel), os.path.join(out, fr_rel))
+    cur = {'scanId': scan_id, 'time': scan_time.isoformat().replace('+00:00', 'Z'), 'src': fr_rel,
+           'radarTime': g['time'].isoformat(), 'base': 'truecolor' if is_day else 'ir'}
+    frames = []
+    cutoff = scan_time - timedelta(minutes=10 * COMPOSITE_FRAMES + 5)
+    for fr in ((prev or {}).get('composite') or {}).get('frames') or []:
+        try:
+            ft = datetime.strptime(fr['scanId'], '%Y%m%d%H%M').replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if not (cutoff <= ft < scan_time) or not re.match(r'^frames/taiwan/radar_sat_\d{12}\.webp$', fr.get('src', '')):
+            continue
+        try:
+            data = http_get(pages_base.rstrip('/') + '/' + fr['src'], timeout=20, binary=True)
+            with open(os.path.join(out, fr['src']), 'wb') as f:
+                f.write(data)
+            frames.append(fr)
+        except Exception:
+            pass
+    frames = sorted(frames, key=lambda x: x['scanId'])[-(COMPOSITE_FRAMES - 1):] + [cur]
+    log('完成 台灣衛星＋雷達疊圖（%s，雷達 %s，%d KB，影格 %d）' % ('真實色' if is_day else '紅外線', cr.tid(g['time']), size // 1024, len(frames)))
+    return {'id': 'taiwan', 'title': '台灣 衛星（真實色／夜間紅外線）＋雷達回波疊圖', 'src': rel, 'base': cur['base'],
+            'scanId': scan_id, 'radarTime': cur['radarTime'], 'bboxLonLat': list(COMPOSITE_BBOX), 'frames': frames}
+
+
 # ----------------------------------------------------------------------------- 主程式
 def main():
     ap = argparse.ArgumentParser()
@@ -802,6 +1038,18 @@ def main():
             ent.update({'name': '台灣及西北太平洋 區域總覽'})
         out_regions.append(ent)
         log('完成 %s（%s）' % (rid, ', '.join(prods)))
+    composite = None
+    try:
+        t3 = time.time()
+        composite = build_composite(scn_ir, scn_vis, scan_id, scan_time, prev, a.pages_base, out, errors)
+        stats['t_composite'] = round(time.time() - t3, 1)
+    except Exception as e:   # 疊圖失敗不影響其他衛星圖
+        errors.append('衛星＋雷達疊圖失敗：%s' % str(e)[:160])
+    maplayers = None
+    try:
+        maplayers = build_map_layers(scn_ir, scn_vis, scan_id, scan_time, out, errors)
+    except Exception as e:   # 失敗不影響其他衛星圖（網站會退回紅外線）
+        errors.append('首頁地圖圖層失敗：%s' % str(e)[:160])
     stats['t_render'] = round(time.time() - t2, 1)
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -822,6 +1070,8 @@ def main():
         'generated': datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z'),
         'products': {k: v['title'] for k, v in PRODUCTS.items()},
         'regions': out_regions,
+        'composite': composite,
+        'maplayers': maplayers,
         'errors': errors,
         'stats': stats,
     }
