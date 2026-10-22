@@ -618,7 +618,51 @@ def setup_font(font_dir):
     rcParams['axes.unicode_minus'] = False
     import logging
     logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
+    _install_glyph_check([font_manager.findfont('DejaVu Sans')] + ([os.path.join(font_dir, fn) for fn in sorted(os.listdir(font_dir))
+                                                                      if fn.lower().endswith(('.otf', '.ttf'))] if os.path.isdir(font_dir) else []))
     _FONT_READY = True
+
+
+# v18：逐字檢查圖上的文字是否都有字形（缺字在 GitHub Actions 上會畫成方框 □）。
+#   只看「隨程式附的字型」（DejaVu Sans＋fonts/ 裡的繁中字型），不算本機另外裝的字型，這樣本機測試和 Actions 結果一致。
+GLYPHS = set()
+MISSING_GLYPHS = {}
+
+
+def _install_glyph_check(paths):
+    from matplotlib.ft2font import FT2Font
+    import matplotlib.text as mtext
+    for fp in paths:
+        try:
+            GLYPHS.update(chr(c) for c in FT2Font(fp).get_charmap().keys())
+        except Exception as e:
+            log('⚠️ 讀不到字型 %s：%s' % (fp, str(e)[:80]))
+    if getattr(mtext.Text, '_hw_glyph_check', False):
+        return
+    orig = mtext.Text.draw
+
+    def draw(self, renderer, *a, **k):
+        try:
+            missing_glyphs(self.get_text(), warn=True)
+        except Exception:
+            pass
+        return orig(self, renderer, *a, **k)
+    mtext.Text.draw = draw
+    mtext.Text._hw_glyph_check = True
+
+
+def missing_glyphs(text, warn=False):
+    """回傳 text 裡字型沒有的字（空字串＝都有）；warn=True 時第一次遇到就在紀錄裡警告。"""
+    if not GLYPHS:
+        return ''
+    miss = ''.join(sorted({c for c in str(text) if ord(c) > 32 and c not in GLYPHS and c not in '\n\r\t'}))
+    if miss and warn:
+        new = ''.join(c for c in miss if c not in MISSING_GLYPHS)
+        for c in miss:
+            MISSING_GLYPHS.setdefault(c, str(text)[:40])
+        if new:
+            log('⚠️ 字型缺字（圖上會變成方框 □）：%s　出現在「%s」→ 請更新 fonts/HWNotoSansTC-subset.otf（tools/make_font_subset.py）' % (new, str(text)[:40]))
+    return miss
 
 
 def render(region, product, data, scan_time, out_path, cmap=None, vr=None, rgb=None):
@@ -1051,6 +1095,8 @@ def main():
     except Exception as e:   # 失敗不影響其他衛星圖（網站會退回紅外線）
         errors.append('首頁地圖圖層失敗：%s' % str(e)[:160])
     stats['t_render'] = round(time.time() - t2, 1)
+    if MISSING_GLYPHS:   # v18：缺字也寫進 latest.json 的 errors，方便從網站上看到
+        errors.append('字型缺字（圖上會變方框）：' + ''.join(sorted(MISSING_GLYPHS)))
     shutil.rmtree(tmp, ignore_errors=True)
 
     # 5) 靜態檔 + latest.json
