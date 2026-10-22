@@ -8,6 +8,7 @@
   3. 雷達缺的時段，直接從氣象署 S3 歷史檔補畫（不用金鑰；每次最多補 BACKFILL_MAX 張，約 1～2 小時就補滿 48 小時）。
   4. 刪掉超過 48 小時的圖，總量超過預算（HIST_BUDGET_MB）就從最舊、最大的產品開始刪。
   5. 寫出 history/history.json（網頁回放用的索引：每種產品的時間與圖片網址）。
+v19：ATMS 微波暖心分析圖（atms/img/，每次過境一張）也收進回放（history/atms/，寬 1000 px），每張附摘要（衛星、最大暖異常、估計氣壓）。
 任何一步失敗都不會擋住部署：最壞情況是沿用快取裡上一版的回放圖。
 需要 numpy＋pillow（兩種安裝路徑都有）。不會讀取或印出任何金鑰。
 """
@@ -34,6 +35,8 @@ SAT_PX, COMP_PX = 1000, 800                    # 首頁地圖衛星圖層、衛�
 REGION_PX = {'overview': 900, 'storm': 640}    # 區域總覽／颱風視窗回放寬度
 WEBP_Q = 70
 REGION_PRODUCTS = ('ir_bd', 'ir_color', 'wv')
+ATMS_PX = 1000
+ATMS_KEYS = ('atcf', 'label', 'name', 'sat', 'satName', 'maxAnom', 'maxHPa', 'dTb8', 'pEst', 'quality')
 UA = {'User-Agent': 'doujin-weather-himawari/1.0 (+GitHub Actions; history)'}
 SAFE = re.compile(r'^history/[a-z0-9_]+/[a-z0-9_]+_\d{12}\.(png|webp)$')
 
@@ -65,14 +68,14 @@ def sid(t):
 
 def empty_index():
     return {'version': 1, 'hours': HOURS, 'cadenceMin': CADENCE_MIN, 'radar': {'bounds': None, 'frames': []},
-            'sat': {'bounds': None, 'truecolor': [], 'wv': []}, 'comp': {'frames': []}, 'regions': {}, 'radarMissing': []}
+            'sat': {'bounds': None, 'truecolor': [], 'wv': []}, 'comp': {'frames': []}, 'atms': {'frames': []}, 'regions': {}, 'radarMissing': []}
 
 
 # ----------------------------------------------------------------------------- 索引走訪
 def groups(idx):
     """回傳 [(名稱, 影格 list)]（list 是索引裡的同一個物件，可就地修改）"""
     out = [('radar', idx['radar']['frames']), ('sat.truecolor', idx['sat']['truecolor']), ('sat.wv', idx['sat']['wv']),
-           ('comp', idx['comp']['frames'])]
+           ('comp', idx['comp']['frames']), ('atms', idx['atms']['frames'])]
     for rid, r in idx['regions'].items():
         for pk in REGION_PRODUCTS:
             out.append(('%s.%s' % (rid, pk), r.setdefault(pk, [])))
@@ -105,7 +108,7 @@ def normalize(idx):
     base = empty_index()
     if not isinstance(idx, dict):
         return base
-    for k in ('radar', 'sat', 'comp'):
+    for k in ('radar', 'sat', 'comp', 'atms'):
         if isinstance(idx.get(k), dict):
             base[k].update(idx[k])
     base['regions'] = {k: v for k, v in (idx.get('regions') or {}).items() if isinstance(v, dict)}
@@ -290,6 +293,31 @@ def run(out, cache, pages_base, now=None, backfill_max=BACKFILL_MAX):
                 if t >= cutoff and due(lst, t, CADENCE_MIN['region']):
                     add(rid + '.' + pk, lst, {'t': iso(t), 'src': 'history/%s/%s_%s.webp' % (rid, pk, fr['scanId'])},
                         lambda dst, p=p, px=px: shrink(p, dst, px))
+    # 3f) v19：ATMS 微波暖心（每次過境一張，不看間隔；以 src 去重）
+    try:
+        with open(os.path.join(out, 'atms', 'latest.json'), encoding='utf-8') as f:
+            aman = json.load(f)
+    except Exception:
+        aman = {}
+    al = idx['atms']['frames']
+    have = {f['src'] for f in al}
+    for ps in aman.get('passes') or []:
+        m = re.match(r'^atms/img/([a-z0-9_]+_\d{12})\.png$', ps.get('src') or '')
+        p = os.path.join(out, ps.get('src') or '-')
+        if not m or not os.path.isfile(p):
+            continue
+        rel = 'history/atms/%s.webp' % m.group(1)
+        try:
+            t = ptime(ps['t'])
+        except Exception:
+            continue
+        if rel in have or t < cutoff:
+            continue
+        ent = {'t': iso(t), 'src': rel}
+        ent.update({k: ps.get(k) for k in ATMS_KEYS if ps.get(k) is not None})
+        add('atms', al, ent, lambda dst, p=p: shrink(p, dst, ATMS_PX))
+        have.add(rel)
+
     for rid in [r for r, m in idx['regions'].items() if not any(m.get(pk) for pk in REGION_PRODUCTS)]:
         del idx['regions'][rid]          # 颱風消散超過 48 小時 → 整個視窗移除
 
