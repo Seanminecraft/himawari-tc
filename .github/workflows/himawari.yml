@@ -6,6 +6,8 @@
 #      向日葵沒新掃描但雷達有新資料 → 只抓回線上衛星圖＋更新雷達（輕量安裝 numpy／pillow）。
 # v18：48 小時回放（history/）：雷達每 10 分鐘、衛星／疊圖每 20 分鐘、颱風／區域圖每 30 分鐘，縮小後存放。
 #      上一版回放圖放在 Actions 快取（hist_cache），不必每次從網站重抓；history/ 預算 250 MB（整站 < 300 MB）。
+# v19：ATMS 衛星微波暖心分析（atms/）：NOAA-20／21／SNPP 經過颱風時，從 NOAA AWS 公開桶（免帳號）只抓需要的幾 MB 來算。
+#      快速檢查會看「有沒有新過境資料」（atms_skip）；沒有的話只把上一版原樣放回網站，不安裝套件。
 name: himawari
 
 on:
@@ -57,7 +59,7 @@ jobs:
         run: python3 scripts/quick_check.py
 
       - name: 安裝 Python 3.12（含 pip 快取）
-        if: steps.quick.outputs.skip != 'true' || steps.quick.outputs.radar_skip != 'true'
+        if: steps.quick.outputs.skip != 'true' || steps.quick.outputs.radar_skip != 'true' || steps.quick.outputs.atms_skip != 'true'
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
@@ -65,6 +67,7 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-radar.txt
+            requirements-atms.txt
 
       - name: 海岸線資料快取（cartopy / Natural Earth）
         if: steps.quick.outputs.skip != 'true'
@@ -77,8 +80,8 @@ jobs:
         if: steps.quick.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
-      - name: 安裝雷達用輕量套件（只更新雷達時）
-        if: steps.quick.outputs.skip == 'true' && steps.quick.outputs.radar_skip != 'true'
+      - name: 安裝雷達用輕量套件（只更新雷達／ATMS 時）
+        if: steps.quick.outputs.skip == 'true' && (steps.quick.outputs.radar_skip != 'true' || steps.quick.outputs.atms_skip != 'true')
         run: pip install -r requirements-radar.txt
 
       - name: 下載衛星原始檔並繪圖
@@ -100,9 +103,10 @@ jobs:
           python scripts/himawari_pipeline.py $ARGS
 
       # v17：向日葵沒新圖、但雷達有新資料 → 先把線上衛星圖原樣抓回來（抓不到就不部署，避免弄壞網站）
-      - name: 抓回線上衛星圖（只更新雷達時）
+      # v19：有新的 ATMS 過境也一樣（這樣 10–20 分鐘內就會更新，不必等下一張向日葵）
+      - name: 抓回線上衛星圖（只更新雷達／ATMS 時）
         id: mirror
-        if: steps.quick.outputs.radar_skip != 'true' && (steps.quick.outputs.skip == 'true' || steps.render.outputs.skip == 'true')
+        if: (steps.quick.outputs.radar_skip != 'true' || steps.quick.outputs.atms_skip != 'true') && (steps.quick.outputs.skip == 'true' || steps.render.outputs.skip == 'true')
         env:
           PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
         run: python3 scripts/mirror_live.py --out site
@@ -123,9 +127,11 @@ jobs:
           RENDER: ${{ steps.render.outputs.skip }}
           MIRROR: ${{ steps.mirror.outcome }}
           RADAR_OK: ${{ steps.radar.outputs.radar_ok }}
+          ATMS_SKIP: ${{ steps.quick.outputs.atms_skip }}
         run: |
-          if [ "$RENDER" = "false" ] || { [ "$MIRROR" = "success" ] && [ "$RADAR_OK" = "true" ]; }; then
-            echo "✅ 部署（衛星：${RENDER:-略過}；雷達：${RADAR_OK:-未跑}）"; echo "skip=false" >> "$GITHUB_OUTPUT"
+          # v19：只有 ATMS 有新過境（雷達剛好抓不到）也要部署
+          if [ "$RENDER" = "false" ] || { [ "$MIRROR" = "success" ] && { [ "$RADAR_OK" = "true" ] || [ "$ATMS_SKIP" = "false" ]; }; }; then
+            echo "✅ 部署（衛星：${RENDER:-略過}；雷達：${RADAR_OK:-未跑}；ATMS 略過：${ATMS_SKIP:-?}）"; echo "skip=false" >> "$GITHUB_OUTPUT"
           else
             echo "⏭️ 不部署（線上已是最新）"; echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
@@ -140,6 +146,34 @@ jobs:
           restore-keys: |
             hist48-v1-
 
+      # v19：ATMS 微波暖心。有新過境才安裝套件＋分析；否則只把上一版（快取→線上網站）放回 site/atms/（只用標準函式庫）
+      - name: 安裝 ATMS 分析套件（有新過境時）
+        if: steps.final.outputs.skip == 'false' && steps.quick.outputs.atms_skip != 'true'
+        continue-on-error: true
+        run: pip install -r requirements-atms.txt
+
+      - name: ATMS 微波暖心分析
+        id: atms
+        if: steps.final.outputs.skip == 'false'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+          MPLBACKEND: Agg
+          ATMS_SKIP: ${{ steps.quick.outputs.atms_skip }}
+        run: |
+          if [ "$ATMS_SKIP" = "true" ]; then
+            python3 scripts/atms_warmcore.py --out site --cache hist_cache --carry
+          else
+            python3 scripts/atms_warmcore.py --out site --cache hist_cache
+          fi
+
+      - name: ATMS 失敗時沿用上一版
+        if: steps.final.outputs.skip == 'false' && steps.atms.outcome == 'failure'
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
+        run: python3 scripts/atms_warmcore.py --out site --cache hist_cache --carry
+
       - name: 48 小時回放（雷達／衛星／颱風圖）
         id: hist
         if: steps.final.outputs.skip == 'false'
@@ -153,6 +187,7 @@ jobs:
       - name: 回放失敗時沿用上一版
         if: steps.final.outputs.skip == 'false' && steps.hist.outcome == 'failure'
         run: |
+          if [ -d hist_cache/atms ] && [ ! -f site/atms/latest.json ]; then mkdir -p site/atms && cp -r hist_cache/atms/. site/atms/; fi
           if [ -d hist_cache/history ]; then
             mkdir -p site/history && cp -r hist_cache/history/. site/history/
             cp -f hist_cache/history.json site/history/history.json 2>/dev/null || true
