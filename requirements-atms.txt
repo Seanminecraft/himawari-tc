@@ -1,0 +1,7 @@
+# v19：ATMS 微波暖心分析（atms_warmcore.py）用的套件；只有「有新過境」時才安裝（約 10–20 秒，有 pip 快取）
+numpy>=2.0
+pillow>=11
+matplotlib>=3.9,<4
+requests>=2.31
+h5py>=3.10
+sgp4>=2.23
