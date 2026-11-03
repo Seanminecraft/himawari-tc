@@ -1,0 +1,8 @@
+numpy
+requests
+matplotlib
+cartopy
+eccodes
+ecmwflibs
+ecmwf-opendata
+pillow
