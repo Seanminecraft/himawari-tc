@@ -200,6 +200,33 @@ jobs:
           path: hist_cache
           key: hist48-v1-${{ github.run_id }}
 
+      # 診斷用：核對這次要發布的 latest.json，並寫一個 deploy-check.json 標記（不影響其他功能）
+      - name: 核對發布內容
+        if: steps.final.outputs.skip == 'false'
+        continue-on-error: true
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, hashlib, datetime
+          p = os.path.realpath('site/latest.json')
+          d = json.load(open(p, encoding='utf-8'))
+          st = os.stat(p)
+          h = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+          print('路徑', p)
+          print('大小', st.st_size, 'bytes；修改時間(UTC)', datetime.datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z')
+          print('sha256', h)
+          print('scanId', d.get('scanId'), 'scanTime', d.get('scanTime'), 'generated', d.get('generated'))
+          mark = {'runId': os.environ['RUN_ID'], 'runAttempt': os.environ['RUN_ATTEMPT'], 'headSha': os.environ['HEAD_SHA'],
+                  'scanId': d.get('scanId'), 'scanTime': d.get('scanTime'), 'generated': d.get('generated'),
+                  'latestSha256': h, 'packedAt': datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'}
+          with open('site/deploy-check.json', 'w', encoding='utf-8') as f:
+              json.dump(mark, f, ensure_ascii=False, indent=1)
+          print('deploy-check.json', json.dumps(mark, ensure_ascii=False))
+          PY
+
       - name: 打包網站
         if: steps.final.outputs.skip == 'false'
         uses: actions/upload-pages-artifact@v5
