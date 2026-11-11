@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""用「這次專用」的版本字串部署 GitHub Pages（取代 actions/deploy-pages 寫死 commit SHA 的做法）。
+"""用「這次專用」的版本部署 GitHub Pages（取代 actions/deploy-pages 寫死 commit SHA 的做法）。
 
 actions/deploy-pages 一律把 GITHUB_SHA 當 pages_build_version（也就是 Pages 部署 ID），而且
 runner 不讓工作流程覆寫 GITHUB_SHA。這個 repo 很少 commit，幾百次部署共用同一個 ID，
 Pages 會不定期把新部署當重複、繼續提供舊內容（actions/deploy-pages#383）。
-這裡直接呼叫同一支官方 API（POST /repos/{repo}/pages/deployments），只是版本字串每次不同。
-需要：job 權限 pages: write、id-token: write；環境變數 GITHUB_TOKEN。只用標準函式庫，不印出任何權杖。
+Pages API 只接受「repo 裡存在的 commit SHA」當版本（自訂字串會 404），所以這裡每次用 Git Data API
+建一個「不掛在任何分支上」的 commit 物件（內容＝目前 commit 的 tree，父＝目前 commit），拿它的 SHA 當版本。
+不會改動 main 或任何分支、不產生歷史紀錄；沒被引用的物件之後由 GitHub 自動清掉。
+再呼叫同一支官方 API（POST /repos/{repo}/pages/deployments）部署。
+需要：job 權限 contents: write（只用來建 commit 物件）、pages: write、id-token: write；環境變數 GITHUB_TOKEN。
+只用標準函式庫，不印出任何權杖。
 """
 import argparse, json, os, sys, time, urllib.request, urllib.error
 
@@ -50,20 +54,31 @@ def out(k, v):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--artifact-id', required=True)
-    ap.add_argument('--version', required=True, help='唯一版本字串，例如 <sha>-r<run_id>-a<attempt>')
+    ap.add_argument('--base-sha', required=True, help='這次 run 的 commit（github.sha）')
+    ap.add_argument('--label', required=True, help='寫進 commit 訊息的標記，例如 run 42950968272 attempt 1')
     ap.add_argument('--timeout', type=int, default=480)
     a = ap.parse_args()
     if not a.artifact_id.strip().isdigit():
         raise SystemExit(f'::error::artifact id 不正確：{a.artifact_id!r}')
     repo, gh = os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_TOKEN']
-    payload = {'artifact_id': int(a.artifact_id), 'pages_build_version': a.version, 'oidc_token': oidc_token()}
-    print(f'建立 Pages 部署：artifact_id={payload["artifact_id"]}，pages_build_version={a.version}')
+    code, c = call('GET', f'{API}/repos/{repo}/git/commits/{a.base_sha}', gh)
+    tree = (c.get('tree') or {}).get('sha') if code == 200 else None
+    if not tree:
+        raise SystemExit(f'::error::讀不到 commit {a.base_sha} 的 tree（HTTP {code}）')
+    code, c = call('POST', f'{API}/repos/{repo}/git/commits', gh,
+                   {'message': f'pages deploy version ({a.label})', 'tree': tree, 'parents': [a.base_sha]})
+    version = c.get('sha') if code in (200, 201) else None
+    if not version:
+        raise SystemExit(f'::error::建立部署版本 commit 失敗 HTTP {code}：{c.get("message")}')
+    out('version', version)
+    payload = {'artifact_id': int(a.artifact_id), 'pages_build_version': version, 'oidc_token': oidc_token()}
+    print(f'建立 Pages 部署：artifact_id={payload["artifact_id"]}，pages_build_version={version}（不在任何分支上的版本 commit）', flush=True)
     code, d = call('POST', f'{API}/repos/{repo}/pages/deployments', gh, payload)
     if code not in (200, 201):
         raise SystemExit(f'::error::建立 Pages 部署失敗 HTTP {code}：{d.get("message")}')
-    dep_id = str(d.get('id') or a.version)
+    dep_id = str(d.get('id') or version)
     out('page_url', d.get('page_url', ''))
-    print(f'已建立部署 ID {dep_id}；page_url {d.get("page_url")}')
+    print(f'已建立部署 ID {dep_id}；page_url {d.get("page_url")}', flush=True)
     t0, last, errs = time.time(), None, 0
     while time.time() - t0 < a.timeout:
         time.sleep(5)
