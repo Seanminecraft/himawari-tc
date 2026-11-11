@@ -8,6 +8,7 @@
 #      上一版回放圖放在 Actions 快取（hist_cache），不必每次從網站重抓；history/ 預算 250 MB（整站 < 300 MB）。
 # v19：ATMS 衛星微波暖心分析（atms/）：NOAA-20／21／SNPP 經過颱風時，從 NOAA AWS 公開桶（免帳號）只抓需要的幾 MB 來算。
 #      快速檢查會看「有沒有新過境資料」（atms_skip）；沒有的話只把上一版原樣放回網站，不安裝套件。
+# v20：部署用唯一版本＋部署後向原站核對，沒生效自動重部署一次，仍失敗就標紅（見 deploy 工作）。
 name: himawari
 
 on:
@@ -40,6 +41,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       skip: ${{ steps.final.outputs.skip }}
+      probe: ${{ steps.mark.outputs.probe }}
     steps:
       - name: 取得程式碼
         uses: actions/checkout@v7
@@ -202,6 +204,7 @@ jobs:
 
       # 診斷用：核對這次要發布的 latest.json，並寫一個 deploy-check.json 標記（不影響其他功能）
       - name: 核對發布內容
+        id: mark
         if: steps.final.outputs.skip == 'false'
         continue-on-error: true
         env:
@@ -225,6 +228,13 @@ jobs:
           with open('site/deploy-check.json', 'w', encoding='utf-8') as f:
               json.dump(mark, f, ensure_ascii=False, indent=1)
           print('deploy-check.json', json.dumps(mark, ensure_ascii=False))
+          # v20：部署後核對用的探針（這次專用的新網址，CDN 沒快取過，保證問到原站）；舊探針不會留在網站上
+          os.makedirs('site/deploy-probe', exist_ok=True)
+          for k in range(48):
+              with open(f"site/deploy-probe/{mark['runId']}-{mark['runAttempt']}-{k}.json", 'w', encoding='utf-8') as f:
+                  json.dump(mark, f, ensure_ascii=False)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('probe=true\n')
           PY
 
       - name: 打包網站
@@ -233,18 +243,66 @@ jobs:
         with:
           path: site
 
+  # v20：一勞永逸修正「部署回報成功、網站卻停在舊圖」
+  # 根因：deploy-pages 預設用 commit SHA 當 Pages 部署版本（pages_build_version＝部署 ID）。
+  #      這個 repo 很少 commit，幾百次部署共用同一個 ID，Pages 會不定期把新部署當成重複而繼續提供舊內容
+  #      （actions/deploy-pages#383；過去空 commit 換了 SHA 就恢復，正是這個原因）。
+  # 修正：① 每次部署用唯一版本（SHA＋run id＋attempt）② 部署後直接向原站核對這次的探針檔
+  #      ③ 沒生效就換一個版本再部署一次 ④ 還是不行就讓這次 run 失敗（紅色），不再假裝成功。
   deploy:
     needs: build
     if: needs.build.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: 取得核對程式
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/verify_pages.py
+          sparse-checkout-cone-mode: false
+
       - name: 部署到 GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+        env:
+          GITHUB_SHA: ${{ github.sha }}-r${{ github.run_id }}-a${{ github.run_attempt }}
+
+      - name: 核對線上網站（原站是否已換成這次）
+        id: verify1
+        if: needs.build.outputs.probe == 'true'
+        continue-on-error: true
+        timeout-minutes: 6
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: python3 scripts/verify_pages.py --base "$PAGE_URL" --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --start 0 --count 24
+
+      - name: 沒生效 → 換新版本再部署一次
+        id: deployment2
+        if: steps.verify1.outcome == 'failure'
+        uses: actions/deploy-pages@v5
+        env:
+          GITHUB_SHA: ${{ github.sha }}-r${{ github.run_id }}-a${{ github.run_attempt }}-retry
+
+      - name: 再次核對（還是舊的就讓這次失敗）
+        if: steps.verify1.outcome == 'failure'
+        timeout-minutes: 6
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          if python3 scripts/verify_pages.py --base "$PAGE_URL" --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --start 24 --count 24; then
+            echo "✅ 重新部署後已生效"
+          else
+            echo "::error::重新部署後 GitHub Pages 仍提供舊內容；請看 githubstatus.com，或手動再跑一次 himawari"
+            exit 1
+          fi
