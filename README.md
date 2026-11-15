@@ -40,8 +40,9 @@ python scripts/himawari_pipeline.py --out site --no-storms             # 只畫�
 
 
 ## 大雷雨監測與提前警示（實驗，v21）
-- `scripts/tstorm_nowcast.py`：在雷達圖層之後執行，輸出 `radar/nowcast.json`（schema `tstorm-nowcast-1.0`）。
+- `scripts/tstorm_nowcast.py`：在雷達圖層之後執行，輸出 `radar/nowcast.json`（schema `tstorm-nowcast-1.1`）。
 - 方法：≥40 dBZ 連通對流胞辨識與配對追蹤（SCIT／TITAN 概念）、TREC 區塊相關移動場、半拉格朗日外延 10–60 分鐘；
   加上氣象署閃電 O-A0039-001 與雨量站 O-A0002-001，判定各場館（`assets/tstorm_venues.json`）與各縣市的 無／注意／警戒／危險。
+- v1.1（2026-11-15）：小於 3 格（約 19 km²）的孤立 ≥40 dBZ 亮點視為雜訊，不畫成對流胞、不用於場館判定與外延；ETA 只在外延回波「比現在更靠近」場館時才算移入（修正 11/15 10:50 臺南單一雜點造成場館誤亮警戒）。
 - 免金鑰（cwaopendata S3）；只用 numpy。失敗時寫 `status: "error"`，網站顯示「監測資料暫無」。
 - **本站自動推估、非中央氣象署警特報**；請以氣象署發布為準。

@@ -29,7 +29,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-VERSION = 'tstorm-nowcast-1.0'
+VERSION = 'tstorm-nowcast-1.1'
 TPE = timezone(timedelta(hours=8))
 S3 = 'https://cwaopendata.s3.ap-northeast-1.amazonaws.com'
 UA = {'User-Agent': 'doujin-weather-nowcast/1.0 (+GitHub Actions)'}
@@ -44,6 +44,8 @@ TH = {'cell': 40.0, 'watch': 45.0, 'warn': 50.0, 'danger': 55.0}
 LEVELS = ['none', 'watch', 'warn', 'danger']
 LEVEL_T = {'none': '無', 'watch': '注意', 'warn': '警戒', 'danger': '危險'}
 MAX_CELLS = 60
+MIN_CELL_PX = 3                                     # 對流胞最小面積（降解析後 3 格≈19 km²）；更小的 ≥40 dBZ 孤立點當雜訊
+APPROACH_KM = 1.0                                   # ETA：預估回波要比現在「更靠近」至少 1 km 才算移入
 DISCLAIMER = ('本資料為本站依氣象署雷達、閃電、雨量站公開資料自動推估之實驗性結果，並非中央氣象署發布之大雷雨即時訊息或任何警特報；'
               '資料有延遲（約 10–25 分鐘）且外延預報準確度有限，對流可能突然生成或消散。請以中央氣象署官方發布為準。')
 
@@ -291,7 +293,7 @@ def hull(pts):
     return lo[:-1] + up[:-1]
 
 
-def find_cells(G, th=TH['cell'], min_px=3):
+def find_cells(G, th=TH['cell'], min_px=MIN_CELL_PX):
     lab, n = label(G.v >= th)
     cells = []
     if not n:
@@ -550,7 +552,13 @@ def build(frames, lightning, gauges, venues, now_ms=None):
     U, V, med = dense_motion(vec_all, G.ny, G.nx)
     motion_ok = bool(vec_all)
     # ---- 對流胞＋追蹤 ----
-    cells, _ = find_cells(G)
+    cells, lab = find_cells(G)
+    # v1.1：孤立的小亮點（<3 格的 ≥40 dBZ，常是地物／海面雜波或雜訊）不算對流：
+    # 地圖不會畫成對流胞，場館判定與外延也不能用它（11/15 10:50 臺南 23.07N 120.33E 單一格 51 dBZ 造成臺南場館誤亮「警戒」）
+    cnt = np.bincount(lab.ravel())
+    speck = (lab > 0) & (cnt[lab] < MIN_CELL_PX)
+    Vc = np.where(speck, np.minimum(G.v, TH['cell'] - 1), G.v).astype(np.float32)
+    n_speck = int(speck.sum())
     if len(Gs) >= 2 and abs((G.time - Gs[-2].time).total_seconds() - 600) <= 60:
         prev, _ = find_cells(Gs[-2])
         if len(Gs) >= 3 and abs((Gs[-2].time - Gs[-3].time).total_seconds() - 600) <= 60:
@@ -563,10 +571,9 @@ def build(frames, lightning, gauges, venues, now_ms=None):
             c.update(prev=None, vy=float(U[iy, ix]), vx=float(V[iy, ix]), how='trec', dmax=None, darea=None, trend='new')
     cells = cells[:MAX_CELLS]
     # ---- 外延 ----
-    fc = advect(G.v, U, V, len(LEADS))
+    fc = advect(Vc, U, V, len(LEADS))
     kx, ky = G.km_x, G.km_y
-    now5, now10, now20 = (max_filter_disk(G.v, r, kx, ky) for r in (5, 10, 20))
-    fcmax = [max_filter_disk(f, 5 + 1.0 * (i + 1), kx, ky) for i, f in enumerate(fc)]   # 不確定性：每 10 分鐘半徑 +1 km
+    now5, now10, now20 = (max_filter_disk(Vc, r, kx, ky) for r in (5, 10, 20))
     t0_ms = int(G.time.timestamp() * 1000)
     Lr = Lightning(lightning, now_ms or t0_ms)
     ltg_ref = Lr.ref
@@ -581,20 +588,43 @@ def build(frames, lightning, gauges, venues, now_ms=None):
             return None
         return float(arr[iy, ix])
 
+    R_NEAR = 25.0
+    ry, rx = int(math.ceil(R_NEAR / ky)), int(math.ceil(R_NEAR / kx))
+
+    def near_dists(arr, fy, fx):
+        """取樣點到各門檻（45/50/55）最近回波格的距離（km；R_NEAR 內沒有 → None）。"""
+        iy, ix = int(round(fy)), int(round(fx))
+        y0, x0 = max(iy - ry, 0), max(ix - rx, 0)
+        win = arr[y0:iy + ry + 1, x0:ix + rx + 1]
+        out = {}
+        if not win.size:
+            return {th: None for th in (45, 50, 55)}
+        yy, xx = np.mgrid[y0:y0 + win.shape[0], x0:x0 + win.shape[1]]
+        d = np.hypot((yy - fy) * ky, (xx - fx) * kx)
+        for th in (45, 50, 55):
+            m = (win >= th) & (d <= R_NEAR)
+            out[th] = float(d[m].min()) if m.any() else None
+        return out
+
     def point(lat, lon, rain):
         n5, n10, n20 = sample(now5, lat, lon), sample(now10, lat, lon), sample(now20, lat, lon)
         if n5 is None:
             return None
+        fy, fx = G.ij(lat, lon)
+        d_now = near_dists(Vc, fy, fx)
+        d_fc = None
         eta = {}
         for th in (45, 50, 55):
             if n5 >= th:
                 eta[str(th)] = 0; continue
+            eta[str(th)] = None
             for i, L_ in enumerate(LEADS):
-                v = sample(fcmax[i], lat, lon)
-                if v is not None and v >= th:
+                if d_fc is None:
+                    d_fc = [near_dists(f, fy, fx) for f in fc]
+                d = d_fc[i][th]
+                # 外延後的回波要進到「5 km＋每 10 分鐘 1 km 不確定半徑」內，而且要比現在更靠近（遠離或滯留的回波不算移入）
+                if d is not None and d <= 5 + 1.0 * (i + 1) and (d_now[th] is None or d < d_now[th] - APPROACH_KM):
                     eta[str(th)] = L_; break
-            else:
-                eta[str(th)] = None
         ltg = {'n10': Lr.count(lat, lon, 10, 10), 'n30': Lr.count(lat, lon, 20, 30), 'n60': Lr.count(lat, lon, 20, 60),
                'prev10': Lr.count(lat, lon, 10, 10, start_min=10)}
         lv, why = judge((round(n5), round(n10), round(n20)), eta, ltg, rain)
@@ -669,6 +699,7 @@ def build(frames, lightning, gauges, venues, now_ms=None):
         'schema': VERSION, 'status': 'ok', 'generated': datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z'),
         'radarTime': G.time.astimezone(TPE).isoformat(), 'frames': [g.time.astimezone(TPE).isoformat() for g in Gs],
         'leads': LEADS, 'thresholds': TH,
+        'qc': {'speckles': n_speck, 'minCellPx': MIN_CELL_PX},
         'motion': {'ok': motion_ok, 'pairs': pairs, 'vectors': len(vec_all),
                    'median': None if not med else {'spd': round(math.hypot(med[0] * ky, med[1] * kx) * 6), 'dir': round((math.degrees(math.atan2(med[1] * kx, med[0] * ky)) + 360) % 360)}},
         'sources': {
@@ -681,7 +712,7 @@ def build(frames, lightning, gauges, venues, now_ms=None):
         'venues': sorted(vout, key=lambda x: (-(LEVELS.index(x['level']) if x['level'] else -1), x['k'])),
         'counties': sorted(counties.values(), key=lambda c: (-LEVELS.index(c['level']), c['c'])),
         'disclaimer': DISCLAIMER,
-        'method': 'TREC 區塊相關移動場＋半拉格朗日外延（強度持續）＋≥40 dBZ 連通對流胞配對追蹤；閃電 O-A0039-001、雨量 O-A0002-001',
+        'method': 'TREC 區塊相關移動場＋半拉格朗日外延（強度持續）＋≥40 dBZ 連通對流胞配對追蹤（孤立小亮點視為雜訊不計）；ETA 需預估回波逐步靠近場館；閃電 O-A0039-001、雨量 O-A0002-001',
         'runtimeSec': None,
     }
     # 閃電點（近 30 分鐘，地圖用；最多 400 點）
@@ -690,7 +721,7 @@ def build(frames, lightning, gauges, venues, now_ms=None):
         s.sort(key=lambda x: -x[0])
         out['lightning'] = [[round(x[1], 3), round(x[2], 3), int(round((ltg_ref - x[0]) / 60000)), 1 if x[3] == 'cg' else 0] for x in s[:400]]
     out['runtimeSec'] = round(time.time() - t_start, 2)
-    return out, {'G': G, 'Gs': Gs, 'fc': fc, 'U': U, 'V': V}
+    return out, {'G': G, 'Gs': Gs, 'fc': fc, 'U': U, 'V': V, 'Vc': Vc}
 
 
 def error_doc(msg):
