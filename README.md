@@ -38,3 +38,10 @@ python scripts/himawari_pipeline.py --out site --no-storms             # 只畫�
 資料來源：JMA Himawari-9（NOAA Open Data Dissemination，AWS `noaa-himawari9`）；颱風定位：NRL Monterey TC Web、UCAR/NCAR b-deck（JTWC best track）。
 
 
+
+## 大雷雨監測與提前警示（實驗，v21）
+- `scripts/tstorm_nowcast.py`：在雷達圖層之後執行，輸出 `radar/nowcast.json`（schema `tstorm-nowcast-1.0`）。
+- 方法：≥40 dBZ 連通對流胞辨識與配對追蹤（SCIT／TITAN 概念）、TREC 區塊相關移動場、半拉格朗日外延 10–60 分鐘；
+  加上氣象署閃電 O-A0039-001 與雨量站 O-A0002-001，判定各場館（`assets/tstorm_venues.json`）與各縣市的 無／注意／警戒／危險。
+- 免金鑰（cwaopendata S3）；只用 numpy。失敗時寫 `status: "error"`，網站顯示「監測資料暫無」。
+- **本站自動推估、非中央氣象署警特報**；請以氣象署發布為準。

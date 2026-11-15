@@ -8,6 +8,7 @@
 #      上一版回放圖放在 Actions 快取（hist_cache），不必每次從網站重抓；history/ 預算 250 MB（整站 < 300 MB）。
 # v19：ATMS 衛星微波暖心分析（atms/）：NOAA-20／21／SNPP 經過颱風時，從 NOAA AWS 公開桶（免帳號）只抓需要的幾 MB 來算。
 #      快速檢查會看「有沒有新過境資料」（atms_skip）；沒有的話只把上一版原樣放回網站，不安裝套件。
+# v21：大雷雨監測（實驗）radar/nowcast.json（scripts/tstorm_nowcast.py；雷達步驟成功才跑，失敗不影響部署）。
 # v20：部署用唯一版本（每次一個不掛分支的 commit 物件，自寫 API 呼叫）＋部署後向原站核對，沒生效自動重部署一次，仍失敗就標紅（見 deploy 工作）。
 name: himawari
 
@@ -123,6 +124,15 @@ jobs:
           PAGES_BASE: ${{ steps.pages.outputs.base_url }}/
           CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
         run: python scripts/cwa_radar.py --out site
+
+      # v21：大雷雨監測與提前警示（實驗）：雷達最近 3 張（O-A0059-001）＋閃電（O-A0039-001）＋雨量站（O-A0002-001）
+      #      → radar/nowcast.json（對流胞追蹤、0–60 分外延、各場館／縣市燈號）。只用 numpy、免金鑰；失敗只會少這個檔，不影響部署。
+      - name: 大雷雨監測（實驗）
+        id: nowcast
+        if: steps.radar.outputs.radar_ok == 'true'
+        continue-on-error: true
+        timeout-minutes: 4
+        run: python scripts/tstorm_nowcast.py --out site
 
       - name: 決定是否部署
         id: final
