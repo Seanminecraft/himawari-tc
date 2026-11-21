@@ -79,14 +79,15 @@ PRODUCTS = {
 COMPOSITE_BBOX = (116.6, 20.4, 124.4, 27.6)   # 經度 116.6–124.4E、緯度 20.4–27.6N（含澎湖、金門、馬祖）
 COMPOSITE_PX = 1000
 COMPOSITE_FRAMES = 12
-MAPLAYER_BBOX = (110.0, 12.0, 135.0, 32.0)    # v17：網站首頁地圖用的真實色／水氣圖層（Web Mercator，直接 L.imageOverlay）
-MAPLAYER_PX = 2000                             # 寬 2000 px ≈ 1.3 km／px
+MAPLAYER_BBOX = (110.0, 12.0, 142.0, 38.0)    # v17：網站首頁地圖用的真實色／水氣圖層（Web Mercator，直接 L.imageOverlay）
+                                               # v23（2026-11-21）：原 110–135E／12–32N → 往北、往東擴到 142E／38N，涵蓋日本關東（東京 35.7N 139.7E）；需要的分段仍是 2–4，下載量不變
+MAPLAYER_PX = 2560                             # 寬 2560 px ≈ 1.3 km／px（v23：2000 → 2560，維持原解析度；高 2324 px）
 FULLDISK_BBOX = (64.0, -75.0, 217.0, 75.0)   # v21.1：首頁全圓盤圖層（星下點 140.7°E ±76°；經度 >180 連續表示，跨換日線；Mercator 只到 ±75°）
 FULLDISK_PX = 1600                            # 寬 1600 px ≈ 10.6 km／px（赤道），縮小看全圓盤用；台灣附近仍由 MAPLAYER 高解析度圖蓋在上面
 FULLDISK_TC_MIN = int(os.environ.get('FULLDISK_TC_MIN', '60'))   # 全圓盤 GeoColor 多久重畫一次（要下載整盤可見光約 510 MB，所以每小時一次；中間沿用線上那張）
 FULLDISK_HOLE_INSET = 0.15                    # 全圓盤圖在台灣高解析度圖範圍挖空（內縮 0.15°），避免兩層半透明疊在一起變深
 BLACKMARBLE_FD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'blackmarble_fulldisk.webp')   # v21.1：Black Marble 2016，FULLDISK_BBOX 的 Web Mercator
-BLACKMARBLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'blackmarble_maplayer.webp')   # v21：NASA Black Marble 2016（GIBS VIIRS_Black_Marble），已裁成 MAPLAYER_BBOX 的 Web Mercator
+BLACKMARBLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'blackmarble_maplayer.webp')   # v21：NASA Black Marble 2016（GIBS VIIRS_Black_Marble），已裁成 MAPLAYER_BBOX 的 Web Mercator（v23 重新下載 110–142E／12–38N，2560×2324）
 COUNTY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', 'tw_county_lines.json')
 CAT_ZH = [(130, '超級颱風'), (64, '颱風'), (34, '熱帶風暴'), (0, '熱帶性低氣壓')]
 
