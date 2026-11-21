@@ -32,7 +32,7 @@ HOURS = 48
 HIST_BUDGET_MB = 250            # history/ 總量上限（GitHub Pages 網站上限 1 GB；整站目標 < 300 MB）
 BACKFILL_MAX = int(os.environ.get('HIST_BACKFILL_MAX', '36'))   # 每次最多從氣象署 S3 補幾張雷達（每張下載約 9 MB）
 CADENCE_MIN = {'radar': 10, 'sat': 20, 'comp': 20, 'region': 30, 'satfd_truecolor': 60, 'satfd_wv': 20}   # v21.1：全圓盤 GeoColor 每小時、水氣每 20 分鐘
-SAT_PX, COMP_PX = 1000, 800                    # 首頁地圖衛星圖層、衛星＋雷達疊圖的回放寬度
+SAT_PX, COMP_PX = 1280, 800                    # 首頁地圖衛星圖層、衛星＋雷達疊圖的回放寬度（v23：衛星 1000 → 1280，範圍擴到關東後維持原解析度）
 SATFD_PX = 800                                 # v21.1：全圓盤回放寬度（800×1215）
 REGION_PX = {'overview': 900, 'storm': 640}    # 區域總覽／颱風視窗回放寬度
 WEBP_Q = 70
@@ -261,12 +261,20 @@ def run(out, cache, pages_base, now=None, backfill_max=BACKFILL_MAX):
     ml = (latest or {}).get('maplayers') or {}
     if ml.get('scanId'):
         t = ptime(ml['scanId'])
-        idx['sat']['bounds'] = ml.get('bounds') or idx['sat']['bounds']
+        nb = ml.get('bounds') or idx['sat']['bounds']
+        ob = idx['sat'].get('bounds')
+        if ob and nb and ob != nb:
+            # v23：首頁高解析度範圍改變（擴到關東）→ 舊影格記下自己的範圍（'b'），回放時才會疊在正確位置
+            for k in ('truecolor', 'wv'):
+                for fr in idx['sat'][k]:
+                    fr.setdefault('b', ob)
+            log('ℹ️ 衛星圖層範圍改變：%s → %s（舊影格保留原範圍）' % (ob, nb))
+        idx['sat']['bounds'] = nb
         for k in ('truecolor', 'wv'):
             e = ml.get(k) or {}
             p = os.path.join(out, e.get('src', '') or '-')
             if e.get('src') and os.path.isfile(p) and t >= cutoff and due(idx['sat'][k], t, CADENCE_MIN['sat']):
-                add('sat.' + k, idx['sat'][k], {'t': iso(t), 'src': 'history/sat/%s_%s.webp' % (k, sid(t))},
+                add('sat.' + k, idx['sat'][k], {'t': iso(t), 'src': 'history/sat/%s_%s.webp' % (k, sid(t)), 'b': nb},
                     lambda dst, p=p: shrink(p, dst, SAT_PX, rgba=True))
 
     # 3c2) v21.1：首頁全圓盤（GeoColor／水氣；各自有自己的時間，GeoColor 沿用舊圖時不會重複收）
